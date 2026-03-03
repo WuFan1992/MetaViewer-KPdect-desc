@@ -100,14 +100,10 @@ class MetaViewer(nn.Module):
         self.num_views = len(sample_data)
 
         # AutoEncoder (encoder s_enc: embedding module, decoder s_dec: reconstruction head)
-        self.s_enc = torch.nn.ModuleList()
-        self.s_dec = torch.nn.ModuleList()
-        for v in range(self.num_views):
-            view_shape = sample_data[v].shape
-            self.s_enc.append(
-                NNEncoder(args=self.args, view_shape=view_shape, v=v))
-            self.s_dec.append(
-                NNDecoder(args=self.args, view_shape=view_shape, v=v))
+        view_shape = sample_data[0].shape  # 所有 view 必须维度一致
+        self.s_enc = NNEncoder(args=self.args, view_shape=view_shape, v=0)
+        self.s_dec = NNDecoder(args=self.args, view_shape=view_shape, v=0)
+        
         # MetaNet: MetaViewer
         meta_channel = args.meta_channels
         meta_channel[0] = self.num_views
@@ -116,11 +112,11 @@ class MetaViewer(nn.Module):
         self.apply(_init_vit_weights)
         self.lossF_mse = torch.nn.MSELoss(reduction='sum')
 
-    def forward_base(self, x, v):
+    def forward_base(self, x):
         x = x.squeeze()
-        x_emb = self.s_enc[v](x)
-        x_meta = self.meta_net(normalize(x_emb, dim=1).unsqueeze(dim=1), [v])
-        x_rec = self.s_dec[v](x_meta.squeeze())
+        x_emb = self.s_enc(x)
+        x_meta = self.meta_net(normalize(x_emb, dim=1).unsqueeze(1), [0])
+        x_rec = self.s_dec(x_meta.squeeze())
         return [x, x_rec]
 
     def loss_base(self, logits):
@@ -132,13 +128,13 @@ class MetaViewer(nn.Module):
         data_embs = []
         data = [data[v].squeeze() for v in range(len(data))]
         for v in range(self.num_views):
-            data_embs.append(self.s_enc[v](data[v]))
+            data_embs.append(self.s_enc(data[v]))
 
         data_embs_cat = torch.transpose(torch.stack([normalize(emb, dim=1) for emb in data_embs]), 1, 0)
         metaviews = self.meta_net(data_embs_cat, views).squeeze()
         data_recs = []
         for v in range(len(views)):
-            data_recs.append(self.s_dec[v](metaviews))
+            data_recs.append(self.s_dec(metaviews))
         return [data, data_embs, metaviews, data_recs]
 
     def loss_meta(self, logits):

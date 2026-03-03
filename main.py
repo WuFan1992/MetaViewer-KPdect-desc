@@ -145,13 +145,13 @@ def main(args):
                     # Inner level on support set
                     for step in range(args.inner_step):
                         for v in range(len(data_support)):
-                            rec_support = fmodel.forward_base(data_support[v], v)
+                            rec_support = fmodel.forward_base(data_support[v])
                             loss_inner = fmodel.loss_base(rec_support)
                             diffopt.step(loss_inner)
                     # Outer level on query set
-                    for v in range(len(data_query)):
-                        fmodel.s_enc[v].zero_grad()
-                        fmodel.s_dec[v].zero_grad()
+                    fmodel.s_enc.zero_grad()
+                    fmodel.s_dec.zero_grad()
+                    
                     logits = fmodel.forward_meta(data_query, [v for v in range(len(data_query))])
                     loss_outer = fmodel.loss_meta(logits)
                     loss_outer.backward()
