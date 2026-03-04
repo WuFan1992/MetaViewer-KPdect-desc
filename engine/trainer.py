@@ -1,20 +1,18 @@
-import os
+import torch
 import torch.utils.data as data
 
 from modules.sfm_dataset import SfMDataset
 from modules.sfm_loader import *
+from modules.utils import *
 
 
-def loadSFM(data_path):
-    
-    sfm_images_path = os.path.join(data_path, "sparse/0", "images.bin")
-    sfm_point3d_path = os.path.join(data_path, "sparse/0/points3D.bin")
-    
-    points = read_points3D_binary(sfm_point3d_path)
-    images = read_extrinsics_binary(sfm_images_path)
-    
-    return points, images
-
+def collate_skip_none(batch):
+    # batch 是 list，每个元素是 dataset[idx] 的返回值
+    # 过滤掉 None
+    batch = [b for b in batch if b is not None]
+    if len(batch) == 0:
+        return None
+    return torch.utils.data._utils.collate.default_collate(batch)
 
 class Trainer(object):
     def __init__(self, metaviewer, kpnet, data_path):
@@ -22,24 +20,30 @@ class Trainer(object):
         self.metaviewer = metaviewer
         self.kpnet = kpnet
         
-        points,images = loadSFM(data_path)
+        points,images, cameras, test_images = loadSFM(data_path)
+        camera_infos = readColmapCameras(images,cameras, test_images)
 
-        self.dataset = SfMDataset(points, images)
-        self.data_loader = data.DataLoader(self.dataset, batch_size=8, shuffle=True)
+        self.dataset = SfMDataset(points, images, camera_infos, data_path)
+        self.data_loader = data.DataLoader(self.dataset, batch_size=8, shuffle=True,collate_fn=collate_skip_none)
         self.data_loader_iter = iter(self.data_loader)  # 把数据变成迭代器，方便使用next 一个一个获取
         
     def train_iters(self, iter_num):
         
         for i in range(iter_num):
             try:
-                view_ids, view_xys = next(self.data_loader_iter)
+                batch = next(self.data_loader_iter)
             except StopIteration:
-                # If StopIteration is raised, create a new iterator.
                 self.data_loader_iter = iter(self.data_loader)
-                view_ids, view_xys = next(self.data_loader_iter)
+                batch = next(self.data_loader_iter)
+            
+            if batch is None:  # 整个 batch 都是 None
+                continue
+            
+            data0, data1 = batch  # 或者根据你的 dataset 返回拆分
                 
-        print("view_ids shape = ", view_ids.shape)
-        print("view_xys shape = ", view_xys.shape)
+            
+
+                
         
 
 if __name__ == "__main__":

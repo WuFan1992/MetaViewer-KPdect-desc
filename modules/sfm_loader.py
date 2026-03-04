@@ -1,9 +1,35 @@
 import numpy as np
 import collections
 import struct
+import sys
+import os
 
+from .utils import *
+
+
+CameraModel = collections.namedtuple(
+    "CameraModel", ["model_id", "model_name", "num_params"])
+Camera = collections.namedtuple(
+    "Camera", ["id", "model", "width", "height", "params"])
 BaseImage = collections.namedtuple(
     "Image", ["id", "qvec", "tvec", "camera_id", "name", "xys", "point3D_ids"])
+
+CAMERA_MODELS = {
+    CameraModel(model_id=0, model_name="SIMPLE_PINHOLE", num_params=3),
+    CameraModel(model_id=1, model_name="PINHOLE", num_params=4),
+    CameraModel(model_id=2, model_name="SIMPLE_RADIAL", num_params=4),
+    CameraModel(model_id=3, model_name="RADIAL", num_params=5),
+    CameraModel(model_id=4, model_name="OPENCV", num_params=8),
+    CameraModel(model_id=5, model_name="OPENCV_FISHEYE", num_params=8),
+    CameraModel(model_id=6, model_name="FULL_OPENCV", num_params=12),
+    CameraModel(model_id=7, model_name="FOV", num_params=5),
+    CameraModel(model_id=8, model_name="SIMPLE_RADIAL_FISHEYE", num_params=4),
+    CameraModel(model_id=9, model_name="RADIAL_FISHEYE", num_params=5),
+    CameraModel(model_id=10, model_name="THIN_PRISM_FISHEYE", num_params=12)
+}
+
+CAMERA_MODEL_IDS = dict([(camera_model.model_id, camera_model)
+                         for camera_model in CAMERA_MODELS])
 
 def qvec2rotmat(qvec):
     return np.array([
@@ -115,3 +141,122 @@ def read_extrinsics_binary(path_to_model_file):
                 camera_id=camera_id, name=image_name,
                 xys=xys, point3D_ids=point3D_ids)
     return images
+
+def read_intrinsics_binary(path_to_model_file):
+    """
+    see: src/base/reconstruction.cc
+        void Reconstruction::WriteCamerasBinary(const std::string& path)
+        void Reconstruction::ReadCamerasBinary(const std::string& path)
+    """
+    cameras = {}
+    with open(path_to_model_file, "rb") as fid:
+        num_cameras = read_next_bytes(fid, 8, "Q")[0]
+        for _ in range(num_cameras):
+            camera_properties = read_next_bytes(
+                fid, num_bytes=24, format_char_sequence="iiQQ")
+            camera_id = camera_properties[0]
+            model_id = camera_properties[1]
+            model_name = CAMERA_MODEL_IDS[camera_properties[1]].model_name
+            width = camera_properties[2]
+            height = camera_properties[3]
+            num_params = CAMERA_MODEL_IDS[model_id].num_params
+            params = read_next_bytes(fid, num_bytes=8*num_params,
+                                     format_char_sequence="d"*num_params)
+            cameras[camera_id] = Camera(id=camera_id,
+                                        model=model_name,
+                                        width=width,
+                                        height=height,
+                                        params=np.array(params))
+        assert len(cameras) == num_cameras
+    return cameras
+
+def readColmapCameras(cam_extrinsics, cam_intrinsics, test_images_name):
+
+    max_id = max(cam_extrinsics.keys())
+    image_name_list = [""] * (max_id+1)  # ex : img_id=768  image_name = 767.color.png 
+    depth_name_list = [""] * (max_id+1)
+    intrinsics_list = [np.zeros((3,3)) for _  in range(max_id+1)]
+    pose_list = [np.zeros((4,4)) for _  in range(max_id+1)]
+    
+    train_idx_list = []
+    test_idx_list = []
+
+    for idx, key in enumerate(cam_extrinsics):  # key 的最小值是1 extr.id 最小值也是1  当extr.id =1 时 img name =  seq-01/frame-000000.color.png
+        sys.stdout.write('\r')
+        # the exact output you're looking for:
+        sys.stdout.write("Reading camera {}/{}".format(idx+1, len(cam_extrinsics)))
+        sys.stdout.flush()
+
+        extr = cam_extrinsics[key]
+        img_name = extr.name
+        
+        
+        # If the img_name is in the test_images_name, put it into a test id list, other wise in a train id list
+        if img_name in test_images_name:
+            test_idx_list.append(extr.id)
+        else:
+            train_idx_list.append(extr.id)
+        
+        image_name_list[key] = img_name
+        depth_name_list[key] = img_name.replace(".color.png", ".depth.png")
+        
+        intr = cam_intrinsics[extr.camera_id]
+        height = intr.height
+        width = intr.width
+
+        uid = intr.id
+        R = np.transpose(qvec2rotmat(extr.qvec))
+        T = np.array(extr.tvec)
+
+        if intr.model=="SIMPLE_PINHOLE" or intr.model=="SIMPLE_RADIAL":
+            focal_length_x = intr.params[0]
+            FovY = focal2fov(focal_length_x, height)
+            FovX = focal2fov(focal_length_x, width)
+        ### elif intr.model=="PINHOLE":
+        elif intr.model=="PINHOLE" or intr.model=="OPENCV":
+            focal_length_x = intr.params[0]
+            focal_length_y = intr.params[1]
+            FovY = focal2fov(focal_length_y, height)
+            FovX = focal2fov(focal_length_x, width)
+        else:
+            assert False, "Colmap camera model not handled: only undistorted datasets (PINHOLE or SIMPLE_PINHOLE cameras) supported!"
+        
+
+        intrinsic = getIntrinsic(FovX, height, width)
+        pose = getExtrinsic(R,T)
+        intrinsics_list[key] = intrinsic
+        pose_list[key] = pose
+        
+    sys.stdout.write('\n')
+    res = {
+            "image_name_list": image_name_list,  # image_name_list[0]= ""
+            "depth_name_list": depth_name_list,
+            "intrinsics_list": intrinsics_list,
+            "pose_list": pose_list,
+            "train_idx_list": train_idx_list,
+            "test_idx_list": test_idx_list,
+    }
+    
+    return res
+
+
+def loadSFM(data_path):
+    
+    sfm_images_path = os.path.join(data_path, "sparse/0", "images.bin")
+    sfm_point3d_path = os.path.join(data_path, "sparse/0/", "points3D.bin")
+    sfm_cameras_path = os.path.join(data_path, "sparse/0/", "cameras.bin")
+    
+    points = read_points3D_binary(sfm_point3d_path)
+    images = read_extrinsics_binary(sfm_images_path)
+    cameras = read_intrinsics_binary(sfm_cameras_path)
+    
+    if os.path.exists(os.path.join(data_path, "sparse/0", "list_test.txt")):
+        
+        # 7scenes
+        with open(os.path.join(data_path, "sparse/0", "list_test.txt")) as f:
+            test_images = f.readlines()
+            test_images = [x.strip() for x in test_images]
+    else:
+        test_images = []
+    
+    return points, images, cameras, test_images
