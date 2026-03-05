@@ -1,7 +1,7 @@
 import torch
 from kornia.utils import create_meshgrid
 import pdb
-import cv2
+import numpy as np
 
 
 @torch.no_grad()
@@ -59,19 +59,29 @@ def warp_kpts(kpts0, depth0, depth1, T_0to1, K0, K1):
 
 
 @torch.no_grad()
-def spvs_coarse(data, scale = 4):
+def spvs_coarse(data0, data1, scale = 4):
     """
         Supervise corresp with dense depth & camera poses
     """
 
     # 1. misc
-    device = data['image0'].device
-    N, _, H0, W0 = data['image0'].squeeze(1).shape
-    _, _, H1, W1 = data['image1'].squeeze(1).shape
+    device = data0['img'].device
+    N, _, H0, W0 = data0['img'].shape
+    _, _, H1, W1 = data1['img'].shape
+    
     #scale = 4
     scale0 = scale
     scale1 = scale
     h0, w0, h1, w1 = map(lambda x: x // scale, [H0, W0, H1, W1])
+    
+    
+    # -------- poses (numpy) --------
+    T0 = data0['pose']      # (4,4)
+    T1 = data1['pose']      # (4,4)
+
+    T_0to1 = T1 @ torch.linalg.inv(T0)
+    T_1to0 = torch.linalg.inv(T_0to1)
+    
 
     # 2. warp grids
     # create kpts in meshgrid and resize them to image resolution
@@ -79,8 +89,8 @@ def spvs_coarse(data, scale = 4):
     grid_pt1_i = scale1 * grid_pt1_c
 
     # warp kpts bi-directionally and check reproj error
-    nonzero_m1, w_pt1_i  =  warp_kpts(grid_pt1_i, data['depth1'].squeeze(1), data['depth0'].squeeze(1), data['T_1to0'].squeeze(1), data['K1'].squeeze(1), data['K0'].squeeze(1)) 
-    nonzero_m2, w_pt1_og =  warp_kpts(w_pt1_i, data['depth0'].squeeze(1), data['depth1'].squeeze(1), data['T_0to1'].squeeze(1), data['K0'].squeeze(1), data['K1'].squeeze(1)) 
+    nonzero_m1, w_pt1_i  =  warp_kpts(grid_pt1_i, data1['depth'], data0['depth'], T_1to0, data1['K'], data0['K']) 
+    nonzero_m2, w_pt1_og =  warp_kpts(w_pt1_i, data0['depth'], data1['depth'], T_0to1, data0['K'], data1['K']) 
 
     # 先将图像1投影到图像2，然后投影点再从图像2投影回图像1，用于双向一致性校验
     dist = torch.linalg.norm( grid_pt1_i - w_pt1_og, dim=-1)

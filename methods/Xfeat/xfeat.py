@@ -13,7 +13,7 @@ class XFeat(nn.Module):
         It supports inference for both sparse and semi-dense feature extraction & matching.
     """
 
-    def __init__(self, weights = os.path.abspath(os.path.dirname(__file__)) + 'xfeat.pt', top_k = 4096, detection_threshold=0.05):
+    def __init__(self, weights = os.path.abspath(os.path.dirname(__file__)) + '/xfeat.pt', top_k = 4096, detection_threshold=0.05):
         super().__init__()
         self.dev = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.net = XFeatModel().to(self.dev).eval()
@@ -39,9 +39,6 @@ class XFeat(nn.Module):
             pass
 
    
-    
-
-
 
     @torch.inference_mode()
     def detectAndCompute(self, x, top_k = None, detection_threshold = None):
@@ -100,7 +97,7 @@ class XFeat(nn.Module):
                ]
 
     @torch.inference_mode
-    def getFeatDesc(self, x, mkpts):
+    def getFeatDesc(self, x):
         """
             Compute sparse keypoints & descriptors. Supports batched mode.
 
@@ -108,19 +105,14 @@ class XFeat(nn.Module):
                 x -> torch.Tensor(B, C, H, W): grayscale or rgb image
                 'mkpts'    ->   torch.Tensor(N, 2): keypoints (x,y)
             return:
-                'descriptors'  ->   torch.Tensor(N, 64): local features
+                'M1'  ->   torch.Tensor(B, C, 1/8H, 1/8W): local features map
         """
         x, _, _ = self.preprocess_tensor(x)
         _, _, _H1, _W1 = x.shape
         M1, _, _ = self.net(x)
         M1 = F.normalize(M1, dim=1)
-        #Interpolate descriptors at kpts positions
-        feats = self.interpolator(M1, mkpts, H = _H1, W = _W1)
-
-        #L2-Normalize
-        feats = F.normalize(feats, dim=-1)
         
-        return feats
+        return M1
 
     @torch.inference_mode()
     def detectAndComputeDense(self, x, top_k = None, multiscale = True):
