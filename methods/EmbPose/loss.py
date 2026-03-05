@@ -4,28 +4,74 @@ import torch.nn.functional as F
 
 def pose_difference(T1, T2, alpha=1.0, beta=1.0):
     """
-    T1, T2: [B,4,4]  SE(3) matrices
-    Returns: [B] scalar pose difference
+    T1, T2: [4,4]  SE(3) matrices
+    Returns: scalar pose difference
     """
-    B = T1.shape[0]
+    # 确保是 float tensor
+    T1 = T1.float()
+    T2 = T2.float()
+    # 旋转部分
+    R1 = T1[:3, :3]  # [3,3]
+    t1 = T1[:3, 3]   # [3]
+    R2 = T2[:3, :3]
+    t2 = T2[:3, 3]
 
-    R1 = T1[:,:3,:3]  # [B,3,3]
-    t1 = T1[:,:3,3]   # [B,3]
-    R2 = T2[:,:3,:3]
-    t2 = T2[:,:3,3]
+    # 相对旋转
+    R_rel = torch.matmul(R1, R2.T)  # [3,3]
+    trace = R_rel[0,0] + R_rel[1,1] + R_rel[2,2]  # scalar
+    theta = torch.acos(torch.clamp((trace - 1)/2, -1+1e-6, 1-1e-6))  # radians
 
-    # relative rotation
-    R_rel = torch.matmul(R1, R2.transpose(1,2))  # [B,3,3]
-    trace = R_rel[:,0,0] + R_rel[:,1,1] + R_rel[:,2,2]  # [B]
-    theta = torch.acos(torch.clamp((trace - 1)/2, -1+1e-6, 1-1e-6))  # [B] radians
+    # 平移差异
+    d_t = torch.norm(t1 - t2)  # scalar
 
-    # translation difference
-    d_t = torch.norm(t1 - t2, dim=1)  # [B]
-
-    # combined pose difference
-    pose_diff = alpha * theta + beta * d_t  # [B]
+    # 综合位姿差异
+    pose_diff = alpha * theta + beta * d_t  # scalar
 
     return pose_diff
+
+def variance_loss_pose_aware_single(
+    desc1_pts,         # [N,C]  source descriptors
+    desc2_pts,         # [N,C]  target descriptors
+    var1_pred,         # [N]    predicted variance for source
+    var2_pred,         # [N]    predicted variance for target
+    pose1,             # [4,4]  source pose
+    pose2,             # [4,4]  target pose
+    reliability1=None, # [N] optional reliability for source
+    reliability2=None, # [N] optional reliability for target
+    alpha=1.0,
+    beta=1.0
+):
+    """
+    Compute pose-aware variance loss for a single pair of features.
+    All inputs are already extracted for N keypoints/features.
+    """
+    N, C = desc1_pts.shape
+
+    # 1. compute pose difference
+    pose_diff = pose_difference(pose1, pose2, alpha, beta)  # [1]
+    pose_diff_norm = pose_diff / (pose_diff.max() + 1e-8)  # scalar normalized
+
+    # 2. compute descriptor difference per feature
+    desc_diff = ((desc1_pts - desc2_pts)**2).sum(dim=1)  # [N]
+
+    # 3. adaptive weight based on pose difference
+    # smaller pose_diff -> weight larger
+    weight = torch.exp(-pose_diff_norm) * (desc_diff / (desc_diff.max() + 1e-8) + 1e-6)  # [N]
+
+    # 4. optional reliability weighting
+    if reliability1 is not None:
+        weight = weight * reliability1  # [N]
+    if reliability2 is not None:
+        weight = weight * reliability2  # [N]
+
+    # 5. weighted MSE for source and target variance
+    loss1 = (weight * (var1_pred - desc_diff)**2).mean()
+    loss2 = (weight * (var2_pred - desc_diff)**2).mean()
+
+    # 6. combined loss
+    loss = (loss1 + loss2) / 2.0
+
+    return loss
 
 
 def variance_loss_pose_aware(
@@ -109,5 +155,11 @@ def reliability_loss(heatmap, target):
     # Compute L1 loss
     L1_loss = F.l1_loss(heatmap, target)
     return L1_loss * 3.0
+
+
+def reconstr_loss(ori, rec):
+    diff = ori - rec
+    reconstr_loss = torch.norm(diff, dim=2).mean()
+    return reconstr_loss
 
 

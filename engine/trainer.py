@@ -7,8 +7,10 @@ from modules.utils import *
 
 from methods.EmbPose.variance_kpnet import VarianceKPNet
 from methods.EmbPose.warper import spvs_coarse
+from methods.EmbPose.loss import *
 
 from methods.Xfeat.xfeat import XFeat
+
 
 
 def collate_skip_none(batch):
@@ -51,12 +53,13 @@ class Trainer(object):
             xfeat_map0 = self.xfeat.getFeatDesc(data0["img"]).to(self.device) 
             xfeat_map1 = self.xfeat.getFeatDesc(data1["img"]).to(self.device) 
             
+            
+               
             pose0_7d = pose_matrix_to_7d(data0["pose"]).to(self.device)
             pose1_7d = pose_matrix_to_7d(data1["pose"]).to(self.device) 
                         
             positives_md_coarse = spvs_coarse(data0, data1, scale=4)
-            
-            print("positive_md_coarse = ", positives_md_coarse)
+        
 
             
             #Check if batch is corrupted with too few correspondences
@@ -69,9 +72,7 @@ class Trainer(object):
                 continue
                         
             xfeat_pred_list = []
-            sampled_desc_list = []
-            sampled_rel_list = []
-            sampled_var_list = []
+
             
             for i in range(len(positives_md_coarse)):
                 pts = positives_md_coarse[i]  # [S_i,4]
@@ -81,21 +82,24 @@ class Trainer(object):
                 coords0 = pts[:, :2].unsqueeze(0).to(self.device)  # [1, S_i, 2]
                 coords1 = pts[:, 2:].unsqueeze(0).to(self.device)
 
-                pose0 = pose0_7d[i].unsqueeze(0)  # [1,7]
-                pose1 = pose1_7d[i].unsqueeze(0)
+                pose0 = data0["pose"][i].to(self.device)
+                pose1 = data1["pose"][i].to(self.device)
+                
 
-
-                xfeat_pred0, sampled_desc0, sampled_rel0, sampled_var0 = self.kpnet(
-                    xfeat_map0[i].unsqueeze(0), pose0, coords0
+                xfeat_pred0, sampled_input0, sampled_desc0, sampled_rel0, sampled_var0 = self.kpnet(
+                    xfeat_map0[i].unsqueeze(0), pose0_7d[i].unsqueeze(0), coords0
                 )
-                xfeat_pred1, sampled_desc1, sampled_rel1, sampled_var1 = self.kpnet(
-                    xfeat_map1[i].unsqueeze(0), pose1, coords1
+                xfeat_pred1, sampled_input1, sampled_desc1, sampled_rel1, sampled_var1 = self.kpnet(
+                    xfeat_map1[i].unsqueeze(0), pose1_7d[i].unsqueeze(0), coords1
                 )
-
-                xfeat_pred_list.append((xfeat_pred0, xfeat_pred1))
-                sampled_desc_list.append((sampled_desc0, sampled_desc1))
-                sampled_rel_list.append((sampled_rel0, sampled_rel1))
-                sampled_var_list.append((sampled_var0, sampled_var1))
+                
+                loss_rec = reconstr_loss(xfeat_pred0, sampled_input0) + reconstr_loss(xfeat_pred1, sampled_input1)
+                
+                loss_ds, conf = dual_softmax_loss(sampled_desc0.squeeze(0),sampled_desc1.squeeze(0))
+                loss_kp = reliability_loss(sampled_rel0, conf) + reliability_loss(sampled_rel1, conf)
+                loss_var = variance_loss_pose_aware_single(sampled_desc0.squeeze(0), sampled_desc1.squeeze(0), sampled_var0, sampled_var1, pose0, pose1, sampled_rel0, sampled_rel1)
+                
+                
             
             print(f"Batch {i}: processed {len(xfeat_pred_list)} elements")
             

@@ -293,6 +293,8 @@ class VarianceKPNet(nn.Module):
             mode='bilinear',
             align_corners=False
         )
+        # 0. sample descriptor from original xfeat input
+        sampled_input = self.sample_map_at_coords(xfeat_up, coords)
 
         # 1. shared feature
         shared_feat = self.backbone(xfeat_up)        # [B, feat_dim, H, W]
@@ -303,13 +305,15 @@ class VarianceKPNet(nn.Module):
 
         # 3. descriptor map (full map)
         desc_map = self.descriptor_encoder(shared_feat)  # [B,feat_dim,H,W]
+        
+        # 4. sample descriptor features at coords
+        sampled_desc = self.sample_map_at_coords(desc_map, coords)  # [B,N,C]
 
-        # 4. reliability map from descriptor
+        # 5. reliability map from descriptor
         reliability_map = self.reliability_head(desc_map)  # [B,1,H,W]
         sampled_rel = self.sample_map_at_coords(reliability_map, coords) # [B,N,1]
 
-        # 5. sample descriptor features at coords
-        sampled_desc = self.sample_map_at_coords(desc_map, coords)  # [B,N,C]
+        
 
         # 6. sample pose features and expand to N
         f_pose = self.pose_encoder(pose)                  # [B,pose_embed]
@@ -326,7 +330,7 @@ class VarianceKPNet(nn.Module):
         xfeat_pred = self.decoder(latent.view(B*N, -1))  # [B*N,C]
         xfeat_pred = xfeat_pred.view(B,N,-1)  # [B,N,C]
 
-        return xfeat_pred, sampled_desc, sampled_rel, sampled_var
+        return xfeat_pred, sampled_input, sampled_desc, sampled_rel, sampled_var
 
 def correspondence_mean_loss(xfeat, xfeat_pred, coords):
     """
