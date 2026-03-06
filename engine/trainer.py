@@ -51,10 +51,18 @@ class Trainer(object):
         
     def train_iters(self):
         
-        w_rec = 0.2
-        w_ds  = 0.05
-        w_kp  = 0.5
-        w_var = 100
+        # -------------------------------
+        # 初始 loss 权重
+        # -------------------------------
+        w_rec_init = 0.2
+        w_ds_init  = 0.05
+        w_kp_init  = 0.1   # 早期 reliability 低，防止梯度塌
+        w_var_init = 50    # early stage 保持 small weight
+
+        w_rec_max = 0.2
+        w_ds_max  = 0.05
+        w_kp_max  = 2
+        w_var_max = 100
     
         
         for iter in range(self.num_iters):
@@ -69,12 +77,7 @@ class Trainer(object):
             
             data0, data1 = batch
             
-            # XFeat forward 
-            xfeat_map0 = self.xfeat.getFeatDesc(data0["img"]).to(self.device) 
-            xfeat_map1 = self.xfeat.getFeatDesc(data1["img"]).to(self.device) 
-            
-            
-               
+            img0, img1 = data0["img"].to(self.device), data1["img"].to(self.device)               
             pose0_7d = pose_matrix_to_7d(data0["pose"]).to(self.device)
             pose1_7d = pose_matrix_to_7d(data1["pose"]).to(self.device) 
                         
@@ -83,14 +86,18 @@ class Trainer(object):
 
             
             #Check if batch is corrupted with too few correspondences
-            is_corrupted = False
-            for p in positives_md_coarse:
-                if len(p) < 30:
-                    is_corrupted = True
-
-            if is_corrupted:
+           # 检查 batch 是否太少对应点
+            if any(len(p) < 30 for p in positives_md_coarse):
                 continue
-                        
+            
+            # -------------------------------
+            # 动态 loss 权重 warmup
+            # -------------------------------
+            progress = np.clip(iter / 2000, 0.0, 1.0)  # 前2000 iteration warmup
+            w_rec  = w_rec_init  + (w_rec_max - w_rec_init) * progress
+            w_ds   = w_ds_init   + (w_ds_max  - w_ds_init)  * progress
+            w_kp   = w_kp_init   + (w_kp_max  - w_kp_init)  * progress
+            w_var  = w_var_init  + (w_var_max - w_var_init) * progress
 
 
             loss_items = []
@@ -107,17 +114,22 @@ class Trainer(object):
                 pose1 = data1["pose"][b].to(self.device)
                 
 
-                xfeat_pred0, sampled_input0, sampled_desc0, sampled_rel0, sampled_var0 = self.kpnet(
-                    xfeat_map0[b].unsqueeze(0), pose0_7d[b].unsqueeze(0), coords0
+                backbone_pred0, sampled_backbone0, sampled_desc0, sampled_rel0, sampled_var0 = self.kpnet(
+                    img0[b].unsqueeze(0), pose0_7d[b].unsqueeze(0), coords0
                 )
-                xfeat_pred1, sampled_input1, sampled_desc1, sampled_rel1, sampled_var1 = self.kpnet(
-                    xfeat_map1[b].unsqueeze(0), pose1_7d[b].unsqueeze(0), coords1
+                backbone_pred1, sampled_backbone1, sampled_desc1, sampled_rel1, sampled_var1 = self.kpnet(
+                    img1[b].unsqueeze(0), pose1_7d[b].unsqueeze(0), coords1
                 )
                 
-                loss_rec = reconstr_loss(xfeat_pred0, sampled_input0) + reconstr_loss(xfeat_pred1, sampled_input1)
+                loss_rec = cross_view_recon_loss(backbone_pred0, sampled_backbone1) + cross_view_recon_loss(backbone_pred1, sampled_backbone0)
                 
-                loss_ds, conf = dual_softmax_loss(sampled_desc0.squeeze(0),sampled_desc1.squeeze(0))
-                loss_kp = reliability_loss(sampled_rel0, conf) + reliability_loss(sampled_rel1, conf)
+                loss_ds, conf = dual_softmax_loss(sampled_desc0.squeeze(0),sampled_desc1.squeeze(0),temp=0.1)
+                
+                # detach + normalize conf 避免 early stage reliability loss 梯度太小
+                conf_detach = conf.detach()
+                conf_detach = conf_detach / (conf_detach.max() + 1e-8)
+                loss_kp = reliability_loss(sampled_rel0, conf_detach) + reliability_loss(sampled_rel1, conf_detach)
+                
                 loss_var = variance_loss_pose_aware_single(sampled_desc0.squeeze(0), sampled_desc1.squeeze(0), sampled_var0, sampled_var1, pose0, pose1, sampled_rel0, sampled_rel1)
                 
                 loss_rec_w = w_rec * loss_rec

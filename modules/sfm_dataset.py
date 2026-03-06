@@ -31,13 +31,13 @@ class SfMDataset(Dataset):
     def __len__(self):
         return self.num_points
 
-    def get_pair(self, idx):
+    def get_pair(self, idx, warmup_epoch=500):
         point_data = self.points_dict[idx]
         X = point_data["xyz"]
         visible_images = point_data["image_ids"]
 
         if len(visible_images) < 2:
-            return None  # 没有足够视角
+            return None
 
         camera_centers = []
         valid_img_ids = []
@@ -49,14 +49,12 @@ class SfMDataset(Dataset):
             valid_img_ids.append(int(img_id))
 
         if len(camera_centers) < 2:
-            return None  # 不够相机中心
+            return None
 
         pairs = []
-
         # ------------------ TRAIN ------------------
         if self.mode == "train":
-            for (i, C_i), (j, C_j) in itertools.combinations(
-                    enumerate(camera_centers), 2):
+            for (i, C_i), (j, C_j) in itertools.combinations(enumerate(camera_centers), 2):
                 img_i = valid_img_ids[i]
                 img_j = valid_img_ids[j]
                 if not (img_i in self.train_samples_idx and img_j in self.train_samples_idx):
@@ -65,27 +63,33 @@ class SfMDataset(Dataset):
                 pairs.append((i, j, theta))
 
             if len(pairs) == 0:
-                return None  # 没有合法 pair
+                return None
 
-            # curriculum: 逐步增加允许最大角度
+            # curriculum: gradually increase allowed max angle
             progress = np.clip(self.epoch / self.total_epoch, 0.0, 1.0)
             allowed_max_angle = progress * self.theta_limit
-            valid_pairs = [p for p in pairs if p[2] <= allowed_max_angle]
 
+            # --- warmup阶段: 强制采样中等角度差 theta >= min_theta
+            min_theta = np.pi / 6
+            if self.epoch < warmup_epoch:
+                valid_pairs = [p for p in pairs if p[2] >= min_theta]
+            else:
+                valid_pairs = [p for p in pairs if p[2] <= allowed_max_angle]
+
+            # fallback: 没有合法 pair 时取最大/最小
             if len(valid_pairs) == 0:
-                pairs.sort(key=lambda x: x[2])  # 最小角度起步
+                pairs.sort(key=lambda x: x[2])
                 i, j, _ = pairs[0]
             else:
-                valid_pairs.sort(key=lambda x: -x[2])  # 在允许范围内选最大
+                # 优先选择角度最大的 pair 以保证 variance supervision 有梯度
+                valid_pairs.sort(key=lambda x: -x[2])
                 i, j, _ = valid_pairs[0]
 
         # ------------------ TEST ------------------
         elif self.mode == "test":
-            for (i, C_i), (j, C_j) in itertools.combinations(
-                    enumerate(camera_centers), 2):
+            for (i, C_i), (j, C_j) in itertools.combinations(enumerate(camera_centers), 2):
                 img_i = valid_img_ids[i]
                 img_j = valid_img_ids[j]
-
                 if img_i in self.train_samples_idx and img_j in self.test_samples_idx:
                     theta = compute_viewing_angle(X, C_i, C_j)
                     pairs.append((i, j, theta))
@@ -94,10 +98,8 @@ class SfMDataset(Dataset):
                     pairs.append((j, i, theta))
 
             if len(pairs) == 0:
-                return None  # 没有合法 pair
-
+                return None
             valid_pairs = [p for p in pairs if p[2] <= self.theta_limit]
-
             if len(valid_pairs) == 0:
                 pairs.sort(key=lambda x: -x[2])
                 i, j, _ = pairs[0]
@@ -119,10 +121,10 @@ class SfMDataset(Dataset):
                 selected_2D_points.append(np.array([0.0, 0.0]))
             else:
                 selected_2D_points.append(img.xys[point_indices[0]])
-
         selected_2D_points = np.stack(selected_2D_points, axis=0)
+
         return torch.tensor(selected_views, dtype=torch.long), \
-               torch.tensor(selected_2D_points, dtype=torch.float)
+                torch.tensor(selected_2D_points, dtype=torch.float)
 
     def __getitem__(self, idx):
         result = self.get_pair(idx)

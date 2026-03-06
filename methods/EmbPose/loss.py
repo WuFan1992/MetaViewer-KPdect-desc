@@ -54,6 +54,10 @@ def variance_loss_pose_aware_single(
 
     # 2. compute descriptor difference per feature
     desc_diff = ((desc1_pts - desc2_pts)**2).sum(dim=1)  # [N]
+    # 对 desc_diff 做归一化，防止数值过大导致 variance loss collapse
+    desc_diff_norm = desc_diff / (desc_diff.max() + 1e-8)
+    # 可以选择 detach 避免梯度直接传回 desc_diff
+    desc_diff_norm_detach = desc_diff_norm.detach()
 
     # 3. adaptive weight based on pose difference
     # smaller pose_diff -> weight larger
@@ -158,6 +162,12 @@ def reliability_loss(heatmap, target):
     target = target.unsqueeze(0).unsqueeze(-1)
     L1_loss = F.l1_loss(heatmap, target)
     return L1_loss 
+
+
+
+def cross_view_recon_loss(pred_feat, target_feat):
+    loss = F.l1_loss(pred_feat, target_feat)
+    return loss
 
 
 def reconstr_loss(ori, rec):

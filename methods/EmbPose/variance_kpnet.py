@@ -1,29 +1,45 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torchvision.models as models
 
 
 # -------------------------
 # Shared Backbone
 # -------------------------
 
+
 class SharedBackbone(nn.Module):
-    def __init__(self, in_channels=64, hidden_dim=128):
+
+    def __init__(self, out_dim=128, freeze=True):
         super().__init__()
 
-        self.net = nn.Sequential(
+        resnet = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V1)
 
-            nn.Conv2d(in_channels, 64, 3, padding=1),
-            nn.ReLU(inplace=True),
-
-            nn.Conv2d(64, hidden_dim, 3, padding=1),
-            nn.ReLU(inplace=True),
-
+        self.backbone = nn.Sequential(
+            resnet.conv1,   # stride 2
+            resnet.bn1,
+            resnet.relu,
+            resnet.maxpool, # stride 2
+            resnet.layer1   # stride 1
         )
+
+        self.proj = nn.Sequential(
+            nn.Conv2d(256, out_dim, 1),
+            nn.GroupNorm(8, out_dim),
+            nn.ReLU(inplace=True)
+        )
+
+        if freeze:
+            for p in self.backbone.parameters():
+                p.requires_grad = False
 
     def forward(self, x):
 
-        return self.net(x)
+        feat = self.backbone(x)   # [B,256,H/4,W/4]
+        feat = self.proj(feat)    # [B,out_dim,H/4,W/4]
+
+        return feat
 
 
 # -------------------------
@@ -122,8 +138,9 @@ class PatchPoseAttentionFusion(nn.Module):
         self.pose_dim = pose_dim
         self.num_heads = num_heads
         self.patch_size = patch_size
+        self.pad = patch_size // 2
 
-        # linear projections for multi-head attention
+        # multi-head projections
         self.q_proj = nn.Linear(desc_dim, desc_dim)
         self.k_proj = nn.Linear(desc_dim, desc_dim)
         self.v_proj = nn.Linear(desc_dim, desc_dim)
@@ -135,53 +152,65 @@ class PatchPoseAttentionFusion(nn.Module):
 
     def forward(self, desc_points, shared_feat_map, coords, pose_embed):
         """
-        desc_points: [B,N,C] 每个采样点的 descriptor
-        shared_feat_map: [B,C,H,W] backbone 特征图
-        coords: [B,N,2] integer coordinates (y,x)
-        pose_embed: [B,pose_dim]
+        desc_points: [B, N, C]
+        shared_feat_map: [B, C, H, W]
+        coords: [B, N, 2]  (y, x)
+        pose_embed: [B, pose_dim]
         """
         B, N, C = desc_points.shape
         H, W = shared_feat_map.shape[2], shared_feat_map.shape[3]
+
         device = desc_points.device
 
-        # 1. 提取每个点周围 patch 特征
-        pad = self.patch_size // 2
-        padded_feat = F.pad(shared_feat_map, (pad, pad, pad, pad))  # [B,C,H+2*pad,W+2*pad]
+        # --------- 1. 提取 patch 特征 ---------
+        # pad fmap
+        padded_feat = F.pad(shared_feat_map, (self.pad, self.pad, self.pad, self.pad))  # [B,C,H+2*pad,W+2*pad]
 
-        patch_feats = []
-        for b in range(B):
-            feats_b = []
-            for n in range(N):
-                y, x = coords[b, n].long()
-                patch = padded_feat[b, :, y:y+self.patch_size, x:x+self.patch_size]  # [C,patch,patch]
-                patch_flat = patch.flatten(1)  # [C, patch*patch]
-                patch_mean = patch_flat.mean(dim=1)  # [C]
-                feats_b.append(patch_mean)
-            patch_feats.append(torch.stack(feats_b, dim=0))  # [N,C]
-        patch_feats = torch.stack(patch_feats, dim=0)  # [B,N,C]
+        # 生成 patch 坐标偏移
+        offsets = torch.arange(-self.pad, self.pad+1, device=device)
+        dy, dx = torch.meshgrid(offsets, offsets, indexing='ij')  # [patch,patch]
+        dy = dy.flatten()
+        dx = dx.flatten()
+        K = self.patch_size ** 2
 
-        # 2. multi-head attention (query=desc, key/value=patch_feats)
-        q = self.q_proj(desc_points).view(B, N, self.num_heads, C//self.num_heads).transpose(1,2)  # [B,heads,N,head_dim]
-        k = self.k_proj(patch_feats).view(B, N, self.num_heads, C//self.num_heads).transpose(1,2)
-        v = self.v_proj(patch_feats).view(B, N, self.num_heads, C//self.num_heads).transpose(1,2)
+        # 扩展 coords
+        y = coords[..., 0].unsqueeze(-1) + dy.view(1,1,-1)  # [B,N,K]
+        x = coords[..., 1].unsqueeze(-1) + dx.view(1,1,-1)  # [B,N,K]
+
+        # clamp 防止越界
+        y = y.clamp(0, H + 2*self.pad - 1)
+        x = x.clamp(0, W + 2*self.pad - 1)
+
+        # long 类型索引
+        y = y.long()
+        x = x.long()
+
+        # 生成 batch index
+        b_idx = torch.arange(B, device=device).view(B,1,1).expand(-1,N,K)  # [B,N,K]
+
+        # gather
+        patch_feats = padded_feat[b_idx, :, y, x]  # [B,N,K,C] ??? 需要 permute
+        patch_feats = patch_feats.permute(0,1,3,2)  # [B,N,C,K]
+        patch_feats = patch_feats.mean(dim=-1)      # [B,N,C] 取 patch 平均
+
+        # --------- 2. multi-head attention ---------
+        q = self.q_proj(desc_points).view(B,N,self.num_heads,C//self.num_heads).transpose(1,2)  # [B,heads,N,head_dim]
+        k = self.k_proj(patch_feats).view(B,N,self.num_heads,C//self.num_heads).transpose(1,2)
+        v = self.v_proj(patch_feats).view(B,N,self.num_heads,C//self.num_heads).transpose(1,2)
 
         attn_scores = torch.matmul(q, k.transpose(-2,-1)) / (C//self.num_heads)**0.5  # [B,heads,N,N]
         attn_probs = F.softmax(attn_scores, dim=-1)
         attn_out = torch.matmul(attn_probs, v)  # [B,heads,N,head_dim]
+        attn_out = attn_out.transpose(1,2).contiguous().view(B,N,C)  # [B,N,C]
 
-        attn_out = attn_out.transpose(1,2).contiguous().view(B, N, C)  # [B,N,C]
+        # --------- 3. pose modulation (FiLM) ---------
+        pose_mod = self.pose_fc(pose_embed).unsqueeze(1)  # [B,1,C]
+        fused = attn_out * (1 + pose_mod)                  # FiLM-like modulation
 
-        # 3. pose modulation (FiLM)
-        pose_mod = self.pose_fc(pose_embed)  # [B,C]
-        pose_mod = pose_mod.unsqueeze(1)     # [B,1,C]
-        fused = attn_out * (1 + pose_mod)    # FiLM-like modulation
-
-        # 4. output projection
+        # --------- 4. output projection ---------
         fused = self.out_fc(fused)  # [B,N,C]
 
         return fused
-
-
 # -------------------------
 # Simple per-point decoder
 # -------------------------
@@ -251,53 +280,46 @@ class VarianceKPNet(nn.Module):
         self.fusion = PatchPoseAttentionFusion(desc_dim=feature_dim, pose_dim=pose_embed)
         self.decoder = PointDecoder(feat_dim=feature_dim, out_dim=in_channels)
         
-    def sample_map_at_coords(self, fmap, coords):
+    def sample_map_at_coords(self,fmap, coords):
         """
-        fmap: [B,C,H,W]
-        coords: [B,N,2]  (y,x)
-
-        return:
-            sampled: [B,N,C]
+        fmap: [B, C, H, W]
+        coords: [B, N, 2]  (y, x) integer coordinates
+        return: [B, N, C]
         """
         B, C, H, W = fmap.shape
         _, N, _ = coords.shape
 
-        idx_y = coords[:,:,0]
-        idx_x = coords[:,:,1]
-        
-        sampled = []
-        for b in range(B):
-            fmap_b = fmap[b]                 # [C,H,W]
-            pts = fmap_b[:, idx_y[b].long(), idx_x[b].long()]  # [C,N]
-            sampled.append(pts.T)            # [N,C]
+        # 将像素坐标归一化到 [-1,1]
+        coords_norm = coords.clone().float()
+        coords_norm[..., 1] = coords_norm[..., 1] / (W - 1) * 2 - 1  # x
+        coords_norm[..., 0] = coords_norm[..., 0] / (H - 1) * 2 - 1  # y
 
-        sampled = torch.stack(sampled, dim=0)  # [B,N,C]
+        # grid_sample 需要 [B,H_out,W_out,2]，我们想要每个点的输出就是 H_out=1, W_out=N
+        coords_norm = coords_norm.unsqueeze(1)  # [B,1,N,2]
 
+        # [B,C,H,W] x [B,1,N,2] -> [B,C,1,N]
+        sampled = F.grid_sample(fmap, coords_norm, mode='bilinear', align_corners=False)
+
+        # reshape 到 [B,N,C]
+        sampled = sampled.squeeze(2).permute(0, 2, 1)  # [B,N,C]
         return sampled
-
-    def forward(self, xfeat, pose, coords):
+    
+    def forward(self, img, pose, coords):
         """
-        xfeat: [B,C,H,W]
+        img: [B,3,H,W]
         pose:  [B,pose_dim]
         coords: [B,N,2] integer coordinates (y,x)
         """
 
-        B, C, H, W = xfeat.shape
+        B, C, H, W = img.shape
         _, N, _ = coords.shape
-        device = xfeat.device
+        device = img.device
         
-        # xfeat is 1/8 of original image, we up sample it to 1/4
-        xfeat_up = F.interpolate(
-            xfeat,
-            scale_factor=2,
-            mode='bilinear',
-            align_corners=False
-        )
-        # 0. sample descriptor from original xfeat input
-        sampled_input = self.sample_map_at_coords(xfeat_up, coords)
+
 
         # 1. shared feature
-        shared_feat = self.backbone(xfeat_up)        # [B, feat_dim, H, W]
+        shared_feat = self.backbone(img)        # [B, feat_dim, H, W]
+        sampled_backbone = self.sample_map_at_coords(shared_feat, coords)
 
         # 2. variance map (full map)
         variance_map = self.variance_head(shared_feat)  # [B,1,H,W]
@@ -327,46 +349,8 @@ class VarianceKPNet(nn.Module):
         latent = F.normalize(latent, dim=2)
 
         # 9. decoder per point (reshape为1x1小图)
-        xfeat_pred = self.decoder(latent.view(B*N, -1))  # [B*N,C]
-        xfeat_pred = xfeat_pred.view(B,N,-1)  # [B,N,C]
+        backbone_pred = self.decoder(latent.view(B*N, -1))  # [B*N,C]
+        backbone_pred = backbone_pred.view(B,N,-1)  # [B,N,C]
 
-        return xfeat_pred, sampled_input, sampled_desc, sampled_rel, sampled_var
-
-def correspondence_mean_loss(xfeat, xfeat_pred, coords):
-    """
-    xfeat:      [B, C, H, W]
-    xfeat_pred: [B, C, H, W]
-    coords:     [B, N, 2]  (y, x) integer coordinates
-    """
-    B, C, H, W = xfeat.shape
-    _, N, _ = coords.shape
-
-    loss = 0.0
-
-    for b in range(B):
-        y = coords[b, :, 0]  # [N]
-        x = coords[b, :, 1]  # [N]
-
-        # 取出对应位置特征: [N, C]
-        f1 = xfeat[b, :, y, x].permute(1, 0)
-        f2 = xfeat_pred[b, :, y, x].permute(1, 0)
-
-        # 计算均值
-        mean = (f1 + f2) / 2
-
-        loss += ((f1 - mean)**2).mean()
-        loss += ((f2 - mean)**2).mean()
-
-    return loss / B
-# -------------------------
-# Loss函数
-# -------------------------
-def intra_object_feature_loss(f):
-    """
-    方法A: 让同一物体N张图片的特征靠近平均值
-    f: [B, N, feature_dim]
-    """
-    f_inv = f.mean(dim=1, keepdim=True)  # [B,1,D]
-    loss = ((f - f_inv) ** 2).sum(dim=2).mean()
-    return loss
+        return backbone_pred, sampled_backbone, sampled_desc, sampled_rel, sampled_var
 
