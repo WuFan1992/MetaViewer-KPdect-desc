@@ -142,3 +142,23 @@ def pose_matrix_to_7d(pose):
     pose7 = torch.cat([q, t], dim=1)
 
     return pose7
+
+
+def check_accuracy(X, Y, pts1 = None, pts2 = None, plot=False):
+    with torch.no_grad():
+        #dist_mat = torch.cdist(X,Y)
+        dist_mat = X @ Y.t()
+        nn = torch.argmax(dist_mat, dim=1)
+        #nn = torch.argmin(dist_mat, dim=1)
+        correct = nn == torch.arange(len(X), device = X.device)
+
+        if pts1 is not None and plot:
+            import matplotlib.pyplot as plt
+            canvas = torch.zeros((60, 80),device=X.device)
+            pts1 = pts1[~correct]
+            canvas[pts1[:,1].long(), pts1[:,0].long()] = 1
+            canvas = canvas.cpu().numpy()
+            plt.imshow(canvas), plt.show()
+
+        acc = correct.sum().item() / len(X)
+        return acc

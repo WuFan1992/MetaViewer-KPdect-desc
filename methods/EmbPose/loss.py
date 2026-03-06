@@ -49,7 +49,8 @@ def variance_loss_pose_aware_single(
 
     # 1. compute pose difference
     pose_diff = pose_difference(pose1, pose2, alpha, beta)  # [1]
-    pose_diff_norm = pose_diff / (pose_diff.max() + 1e-8)  # scalar normalized
+    #pose_diff_norm = pose_diff / (pose_diff.max() + 1e-8)  # scalar normalized
+    pose_diff_norm = pose_diff / (alpha + beta + 1e-6)
 
     # 2. compute descriptor difference per feature
     desc_diff = ((desc1_pts - desc2_pts)**2).sum(dim=1)  # [N]
@@ -57,6 +58,7 @@ def variance_loss_pose_aware_single(
     # 3. adaptive weight based on pose difference
     # smaller pose_diff -> weight larger
     weight = torch.exp(-pose_diff_norm) * (desc_diff / (desc_diff.max() + 1e-8) + 1e-6)  # [N]
+    weight = torch.clamp(weight, min=1e-3)  # 防止权重消失
 
     # 4. optional reliability weighting
     if reliability1 is not None:
@@ -153,8 +155,9 @@ def dual_softmax_loss(X, Y, temp = 0.2):
 
 def reliability_loss(heatmap, target):
     # Compute L1 loss
+    target = target.unsqueeze(0).unsqueeze(-1)
     L1_loss = F.l1_loss(heatmap, target)
-    return L1_loss * 3.0
+    return L1_loss 
 
 
 def reconstr_loss(ori, rec):
