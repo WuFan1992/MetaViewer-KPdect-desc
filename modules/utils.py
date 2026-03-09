@@ -6,6 +6,7 @@ import os.path as osp
 import cv2
 import torch.nn.functional as F
 from skimage.io import imread
+import matplotlib.pyplot as plt
 # -----------------------------
 # 计算相机中心
 # -----------------------------
@@ -143,6 +144,30 @@ def pose_matrix_to_7d(pose):
 
     return pose7
 
+def sample_map_at_coords(fmap, coords):
+    """
+        fmap: [B, C, H, W]
+        coords: [B, N, 2]  (y, x) integer coordinates
+        return: [B, N, C]
+    """
+    B, C, H, W = fmap.shape
+    _, N, _ = coords.shape
+
+    # 将像素坐标归一化到 [-1,1]
+    coords_norm = coords.clone().float()
+    coords_norm[..., 1] = coords_norm[..., 1] / (W - 1) * 2 - 1  # x
+    coords_norm[..., 0] = coords_norm[..., 0] / (H - 1) * 2 - 1  # y
+
+    # grid_sample 需要 [B,H_out,W_out,2]，我们想要每个点的输出就是 H_out=1, W_out=N
+    coords_norm = coords_norm.unsqueeze(1)  # [B,1,N,2]
+
+    # [B,C,H,W] x [B,1,N,2] -> [B,C,1,N]
+    sampled = F.grid_sample(fmap, coords_norm, mode='bilinear', align_corners=False)
+
+    # reshape 到 [B,N,C]
+    sampled = sampled.squeeze(2).permute(0, 2, 1)  # [B,N,C]
+    return sampled 
+
 
 def check_accuracy(X, Y, pts1 = None, pts2 = None, plot=False):
     with torch.no_grad():
@@ -154,7 +179,7 @@ def check_accuracy(X, Y, pts1 = None, pts2 = None, plot=False):
 
         if pts1 is not None and plot:
             import matplotlib.pyplot as plt
-            canvas = torch.zeros((60, 80),device=X.device)
+            canvas = torch.zeros((120, 160),device=X.device)
             pts1 = pts1[~correct]
             canvas[pts1[:,1].long(), pts1[:,0].long()] = 1
             canvas = canvas.cpu().numpy()
@@ -162,3 +187,61 @@ def check_accuracy(X, Y, pts1 = None, pts2 = None, plot=False):
 
         acc = correct.sum().item() / len(X)
         return acc
+    
+def visualize_matches(X, Y, pts1, pts2, img1, img2, topk=None):
+    """
+    X, Y : descriptor (N,D)
+    pts1 : (N,2) keypoints in image1
+    pts2 : (N,2) keypoints in image2
+    img1,img2 : numpy images
+    """
+
+    with torch.no_grad():
+        # 相似度矩阵
+        sim = X @ Y.t()
+
+        # 最近邻匹配
+        nn = torch.argmax(sim, dim=1)
+
+        if topk is not None:
+            sim_val, idx = torch.topk(sim.max(dim=1).values, topk)
+            pts1 = pts1[idx]
+            nn = nn[idx]
+            
+        if isinstance(pts1, torch.Tensor):
+            pts1 = pts1.detach().cpu().numpy()
+
+        if isinstance(pts2, torch.Tensor):
+            pts2 = pts2.detach().cpu().numpy()
+
+        if isinstance(img1, torch.Tensor):
+            img1 = img1.detach().cpu().numpy()
+
+        if isinstance(img2, torch.Tensor):
+            img2 = img2.detach().cpu().numpy()
+
+        nn = nn.cpu().numpy()
+
+        h1, w1 = img1.shape[:2]
+        h2, w2 = img2.shape[:2]
+
+        # 拼接两张图
+        canvas = np.zeros((max(h1,h2), w1+w2, 3), dtype=np.uint8)
+        canvas[:h1,:w1] = img1
+        canvas[:h2,w1:w1+w2] = img2
+
+        plt.figure(figsize=(10,5))
+        plt.imshow(canvas)
+
+        for i,p in enumerate(pts1):
+            x1,y1 = p
+            x2,y2 = pts2[nn[i]]
+
+            # 第二张图要偏移 w1
+            x2_shift = x2 + w1
+
+            plt.plot([x1,x2_shift],[y1,y2],'r-',linewidth=0.8)
+            plt.scatter([x1,x2_shift],[y1,y2],c='yellow',s=5)
+
+        plt.axis('off')
+        plt.show()

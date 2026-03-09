@@ -253,7 +253,7 @@ class SpatialFeatureMasking(nn.Module):
 # Dense Feature AutoEncoder
 # -------------------------
 
-class VarianceKPNet(nn.Module):
+class VarianceKPNetModel(nn.Module):
 
     def __init__(self,
                  in_channels=64,

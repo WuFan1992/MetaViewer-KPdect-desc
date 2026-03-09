@@ -9,7 +9,7 @@ from modules.sfm_dataset import SfMDataset
 from modules.sfm_loader import *
 from modules.utils import *
 
-from methods.EmbPose.variance_kpnet import VarianceKPNet
+from methods.EmbPose.varkpnetmodel import VarianceKPNetModel
 from methods.EmbPose.warper import spvs_coarse
 from methods.EmbPose.loss import *
 
@@ -46,7 +46,7 @@ class Trainer(object):
         self.num_iters = num_iters
         self.progress_bar = tqdm(range(0, self.num_iters), desc="Training progress")
         self.writer = SummaryWriter(cpkt_save_path + f'/logdir/scr_kpdect_' + time.strftime("%Y_%m_%d-%H_%M_%S"))
-        self.save_ckpt_every = 500
+        self.save_ckpt_every = 2000
         self.cpkt_save_path = cpkt_save_path
         
     def train_iters(self):
@@ -56,13 +56,13 @@ class Trainer(object):
         # -------------------------------
         w_rec_init = 0.2
         w_ds_init  = 0.05
-        w_kp_init  = 0.2   # 早期 reliability 低，防止梯度塌
-        w_var_init = 50    # early stage 保持 small weight
+        w_kp_init  = 0.5   # 早期 reliability 低，防止梯度塌
+        w_var_init = 200    # early stage 保持 small weight
 
         w_rec_max = 0.2
         w_ds_max  = 0.05
-        w_kp_max  = 10
-        w_var_max = 100
+        w_kp_max  = 50
+        w_var_max = 500
     
         
         for iter in range(self.num_iters):
@@ -195,8 +195,8 @@ class Trainer(object):
 if __name__ == "__main__":
     data_path = "datasets/head"
     cpkt_save_path = "checkpoints/"
-    num_iters = 1000
-    variance_kpnet = VarianceKPNet(in_channels=64, pose_dim=7, feature_dim=64, pose_embed=64)
+    num_iters = 8000
+    variance_kpnet = VarianceKPNetModel(in_channels=64, pose_dim=7, feature_dim=64, pose_embed=64)
     trainer = Trainer(variance_kpnet, data_path, cpkt_save_path, num_iters)
     trainer.train_iters()
 
