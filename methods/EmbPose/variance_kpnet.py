@@ -280,63 +280,10 @@ class VarianceKPNet(nn.Module):
         self.fusion = PatchPoseAttentionFusion(desc_dim=feature_dim, pose_dim=pose_embed)
         self.decoder = PointDecoder(feat_dim=feature_dim, out_dim=in_channels)
         
-    def sample_map_at_coords(self,fmap, coords):
-        """
-        fmap: [B, C, H, W]
-        coords: [B, N, 2]  (y, x) integer coordinates
-        return: [B, N, C]
-        """
-        B, C, H, W = fmap.shape
-        _, N, _ = coords.shape
-
-        # 将像素坐标归一化到 [-1,1]
-        coords_norm = coords.clone().float()
-        coords_norm[..., 1] = coords_norm[..., 1] / (W - 1) * 2 - 1  # x
-        coords_norm[..., 0] = coords_norm[..., 0] / (H - 1) * 2 - 1  # y
-
-        # grid_sample 需要 [B,H_out,W_out,2]，我们想要每个点的输出就是 H_out=1, W_out=N
-        coords_norm = coords_norm.unsqueeze(1)  # [B,1,N,2]
-
-        # [B,C,H,W] x [B,1,N,2] -> [B,C,1,N]
-        sampled = F.grid_sample(fmap, coords_norm, mode='bilinear', align_corners=False)
-
-        # reshape 到 [B,N,C]
-        sampled = sampled.squeeze(2).permute(0, 2, 1)  # [B,N,C]
-        return sampled
     
-    def forward(self, img, pose, coords):
-        """
-        img: [B,3,H,W]
-        pose:  [B,pose_dim]
-        coords: [B,N,2] integer coordinates (y,x)
-        """
-
-        B, C, H, W = img.shape
-        _, N, _ = coords.shape
-        device = img.device
+    def reconstruction(self, pose, coords, sampled_desc, shared_feat):
         
-
-
-        # 1. shared feature
-        shared_feat = self.backbone(img)        # [B, feat_dim, H, W]
-        sampled_backbone = self.sample_map_at_coords(shared_feat, coords)
-
-        # 2. variance map (full map)
-        variance_map = self.variance_head(shared_feat)  # [B,1,H,W]
-        sampled_var = self.sample_map_at_coords(variance_map, coords)   # [B,N,1]
-
-        # 3. descriptor map (full map)
-        desc_map = self.descriptor_encoder(shared_feat)  # [B,feat_dim,H,W]
-        
-        # 4. sample descriptor features at coords
-        sampled_desc = self.sample_map_at_coords(desc_map, coords)  # [B,N,C]
-
-        # 5. reliability map from descriptor
-        reliability_map = self.reliability_head(desc_map)  # [B,1,H,W]
-        sampled_rel = self.sample_map_at_coords(reliability_map, coords) # [B,N,1]
-
-        
-
+        B, N, _ = coords.shape
         # 6. sample pose features and expand to N
         f_pose = self.pose_encoder(pose)                  # [B,pose_embed]
         f_pose = f_pose.unsqueeze(1).expand(-1,N,-1)     # [B,N,pose_embed]
@@ -351,6 +298,31 @@ class VarianceKPNet(nn.Module):
         # 9. decoder per point (reshape为1x1小图)
         backbone_pred = self.decoder(latent.view(B*N, -1))  # [B*N,C]
         backbone_pred = backbone_pred.view(B,N,-1)  # [B,N,C]
+        
+        return backbone_pred
+        
+    
+    def forward(self, img):
+        """
+        img: [B,3,H,W]
+        pose:  [B,pose_dim]
+        coords: [B,N,2] integer coordinates (y,x)
+        """
 
-        return backbone_pred, sampled_backbone, sampled_desc, sampled_rel, sampled_var
+        # 1. shared feature
+        shared_featmap = self.backbone(img)        # [B, feat_dim, H, W]
+
+        # 2. variance map (full map)
+        variance_map = self.variance_head(shared_featmap)  # [B,1,H,W]
+
+        # 3. descriptor map (full map)
+        desc_map = self.descriptor_encoder(shared_featmap)  # [B,feat_dim,H,W]
+        
+        # 5. reliability map from descriptor
+        reliability_map = self.reliability_head(desc_map)  # [B,1,H,W]
+
+        return shared_featmap, variance_map, desc_map, reliability_map
+        
+
+
 
