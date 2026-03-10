@@ -36,48 +36,40 @@ def variance_loss_pose_aware_single(
     var2_pred,         # [N]    predicted variance for target
     pose1,             # [4,4]  source pose
     pose2,             # [4,4]  target pose
-    reliability1=None, # [N] optional reliability for source
-    reliability2=None, # [N] optional reliability for target
+    reliability1=None, # [N] optional
+    reliability2=None, # [N] optional
     alpha=1.0,
-    beta=1.0
+    beta=1.0,
+    detach_desc_diff=True,
+    min_weight=0.1
 ):
     """
-    Compute pose-aware variance loss for a single pair of features.
-    All inputs are already extracted for N keypoints/features.
+    Pose-aware variance loss with early-stage stabilization.
     """
-    N, C = desc1_pts.shape
-
-    # 1. compute pose difference
-    pose_diff = pose_difference(pose1, pose2, alpha, beta)  # [1]
-    #pose_diff_norm = pose_diff / (pose_diff.max() + 1e-8)  # scalar normalized
+    # 1. 计算 pose 差异
+    pose_diff = pose_difference(pose1, pose2, alpha, beta)  # scalar
     pose_diff_norm = pose_diff / (alpha + beta + 1e-6)
 
-    # 2. compute descriptor difference per feature
-    desc_diff = ((desc1_pts - desc2_pts)**2).sum(dim=1)  # [N]
-    # 对 desc_diff 做归一化，防止数值过大导致 variance loss collapse
-    desc_diff_norm = desc_diff / (desc_diff.max() + 1e-8)
-    # 可以选择 detach 避免梯度直接传回 desc_diff
-    desc_diff_norm_detach = desc_diff_norm.detach()
+    # 2. descriptor 差异
+    desc_diff = ((desc1_pts - desc2_pts) ** 2).sum(dim=1)  # [N]
+    if detach_desc_diff:
+        desc_diff = desc_diff.detach()  # early stage 不让梯度通过 desc_diff
 
-    # 3. adaptive weight based on pose difference
-    # smaller pose_diff -> weight larger
-    weight = torch.exp(-pose_diff_norm) * (desc_diff / (desc_diff.max() + 1e-8) + 1e-6)  # [N]
-    weight = torch.clamp(weight, min=1e-3)  # 防止权重消失
+    # 3. 归一化权重 + clamp 最小值
+    weight = torch.exp(-pose_diff_norm) * (desc_diff / (desc_diff.max() + 1e-8) + 1e-6)
+    weight = torch.clamp(weight, min=min_weight)  # 避免 early stage 权重过小
 
-    # 4. optional reliability weighting
+    # 4. reliability 加权
     if reliability1 is not None:
-        weight = weight * reliability1  # [N]
+        weight = weight * reliability1
     if reliability2 is not None:
-        weight = weight * reliability2  # [N]
+        weight = weight * reliability2
 
-    # 5. weighted MSE for source and target variance
-    loss1 = (weight * (var1_pred - desc_diff)**2).mean()
-    loss2 = (weight * (var2_pred - desc_diff)**2).mean()
+    # 5. log-variance + L2 loss 避免 collapse
+    loss1 = (weight * (torch.log(var1_pred + 1e-6) - torch.log(desc_diff + 1e-6)) ** 2).mean()
+    loss2 = (weight * (torch.log(var2_pred + 1e-6) - torch.log(desc_diff + 1e-6)) ** 2).mean()
 
-    # 6. combined loss
-    loss = (loss1 + loss2) / 2.0
-
-    return loss
+    return (loss1 + loss2) / 2.0
 
 
 def variance_loss_pose_aware(
@@ -135,7 +127,7 @@ def variance_loss_pose_aware(
     return loss / B
 
 
-
+"""
 def dual_softmax_loss(X, Y, temp = 0.2):
     if X.size() != Y.size() or X.dim() != 2 or Y.dim() != 2:
         raise RuntimeError('Error: X and Y shapes must match and be 2D matrices')
@@ -155,7 +147,44 @@ def dual_softmax_loss(X, Y, temp = 0.2):
            F.nll_loss(conf_matrix21, target)
 
     return loss, conf
+    """
+def dual_softmax_loss(X, Y, temp=0.3, hard_negative_k=5):
+    """
+    X, Y: [N, C] descriptors
+    temp: softmax temperature
+    hard_negative_k: top-K hard negatives to emphasize
+    """
+    # L2-normalize descriptors
+    X = F.normalize(X, dim=1)
+    Y = F.normalize(Y, dim=1)
 
+    # cosine similarity
+    sim_matrix = X @ Y.t()  # [N, N]
+    sim_matrix = sim_matrix / temp
+
+    # Hard-negative emphasis: top-K largest non-diagonal similarities
+    N = X.shape[0]
+    mask = torch.eye(N, device=X.device).bool()
+    hard_neg_values, _ = torch.topk(sim_matrix.masked_fill(mask, -1e9), k=hard_negative_k, dim=1)
+    hard_neg_weight = torch.mean(hard_neg_values, dim=1, keepdim=True)  # [N,1]
+    sim_matrix = sim_matrix - hard_neg_weight  # 强调 hard negatives
+
+    # log-softmax
+    log_prob12 = F.log_softmax(sim_matrix, dim=1)
+    log_prob21 = F.log_softmax(sim_matrix.t(), dim=1)
+
+    # target
+    target = torch.arange(N, device=X.device)
+
+    loss = F.nll_loss(log_prob12, target) + F.nll_loss(log_prob21, target)
+
+    # confidence for reliability
+    with torch.no_grad():
+        conf12 = torch.exp(log_prob12).max(dim=-1)[0]
+        conf21 = torch.exp(log_prob21).max(dim=-1)[0]
+        conf = conf12 * conf21
+
+    return loss, conf
 
 def reliability_loss(heatmap, target):
     # Compute L1 loss

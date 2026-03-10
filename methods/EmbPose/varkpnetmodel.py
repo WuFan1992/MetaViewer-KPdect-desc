@@ -47,17 +47,25 @@ class SharedBackbone(nn.Module):
 # -------------------------
 
 class DescriptorEncoder(nn.Module):
+
     def __init__(self, in_dim=128, desc_dim=128):
         super().__init__()
 
-        self.conv = nn.Conv2d(in_dim, desc_dim, 3, padding=1)
+        self.net = nn.Sequential(
+            nn.Conv2d(in_dim, desc_dim, 3, padding=1),
+            nn.GroupNorm(8, desc_dim),
+            nn.ReLU(inplace=True),
+
+            nn.Conv2d(desc_dim, desc_dim, 3, padding=1),
+            nn.GroupNorm(8, desc_dim),
+            nn.ReLU(inplace=True),
+
+            nn.Conv2d(desc_dim, desc_dim, 1)
+        )
 
     def forward(self, x):
-
-        desc = self.conv(x)
-
+        desc = self.net(x)
         desc = F.normalize(desc, dim=1)
-
         return desc
 
 
@@ -66,22 +74,20 @@ class DescriptorEncoder(nn.Module):
 # -------------------------
 
 class VarianceHead(nn.Module):
-    def __init__(self, feat_dim=128):
+    def __init__(self, feat_dim=128, epsilon=1e-2):
         super().__init__()
-
+        self.epsilon = epsilon
         self.net = nn.Sequential(
 
             nn.Conv2d(feat_dim, 64, 3, padding=1),
             nn.ReLU(inplace=True),
 
-            nn.Conv2d(64, 1, 1),
-
-            nn.Softplus()  # variance must be positive
+            nn.Conv2d(64, 1, 1)
         )
 
     def forward(self, x):
-
-        return self.net(x)
+        var_pred = F.softplus(self.net(x)) + self.epsilon
+        return var_pred
 
 
 # -------------------------

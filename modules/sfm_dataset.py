@@ -5,6 +5,7 @@ from torch.utils.data import Dataset
 import numpy as np
 import itertools
 import os
+import random
 from .utils import *
 
 
@@ -53,6 +54,7 @@ class SfMDataset(Dataset):
 
         pairs = []
         # ------------------ TRAIN ------------------
+        """
         if self.mode == "train":
             for (i, C_i), (j, C_j) in itertools.combinations(enumerate(camera_centers), 2):
                 img_i = valid_img_ids[i]
@@ -70,7 +72,7 @@ class SfMDataset(Dataset):
             allowed_max_angle = progress * self.theta_limit
 
             # --- warmup阶段: 强制采样中等角度差 theta >= min_theta
-            min_theta = np.pi / 6
+            min_theta = np.pi / 6 
             if self.epoch < warmup_epoch:
                 valid_pairs = [p for p in pairs if p[2] >= min_theta]
             else:
@@ -84,7 +86,53 @@ class SfMDataset(Dataset):
                 # 优先选择角度最大的 pair 以保证 variance supervision 有梯度
                 valid_pairs.sort(key=lambda x: -x[2])
                 i, j, _ = valid_pairs[0]
+        """
+        if self.mode == "train":
 
+            for (i, C_i), (j, C_j) in itertools.combinations(enumerate(camera_centers), 2):
+
+                img_i = valid_img_ids[i]
+                img_j = valid_img_ids[j]
+
+                if not (img_i in self.train_samples_idx and img_j in self.train_samples_idx):
+                    continue
+
+                theta = compute_viewing_angle(X, C_i, C_j)
+
+                pairs.append((i, j, theta))
+
+            if len(pairs) == 0:
+                return None
+
+
+            # 20% hard baseline
+            if random.random() < 0.2:
+                pairs.sort(key=lambda x: -x[2])
+                i, j, _ = pairs[0]
+
+            else:
+
+                bins = [
+            (0, np.pi/12),
+            (np.pi/12, np.pi/6),
+            (np.pi/6, np.pi/4),
+            (np.pi/4, np.pi/2),
+            ]
+
+                bin_pairs = []
+
+                for low, high in bins:
+                    candidates = [p for p in pairs if low <= p[2] < high]
+                    if len(candidates) > 0:
+                        bin_pairs.append(candidates)
+
+                if len(bin_pairs) == 0:
+                    return None
+
+                selected_bin = random.choice(bin_pairs)
+
+                i, j, _ = random.choice(selected_bin)
+        
         # ------------------ TEST ------------------
         elif self.mode == "test":
             for (i, C_i), (j, C_j) in itertools.combinations(enumerate(camera_centers), 2):
@@ -132,7 +180,7 @@ class SfMDataset(Dataset):
             # 这个点没有合法 pair，直接跳过
             return None
         pair_idx, pts_2d = result
-
+        
         data0 = load_data(self.data_path, self.camera_infos, pair_idx[0])
         data1 = load_data(self.data_path, self.camera_infos, pair_idx[1])
         

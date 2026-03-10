@@ -92,7 +92,7 @@ def load_data(base_dir, scene_info, idx):
     img, depth, pose, K = load_raw_data(base_dir, scene_info, idx, read_img=True)
 
     img = img.astype(np.float32).transpose(2,0,1)
-
+    
     return {
         "pose": pose.astype(np.float32),
         "K": K.astype(np.float32),
