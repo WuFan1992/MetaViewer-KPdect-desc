@@ -63,16 +63,28 @@ def plot_matched_keypoints(image1, keypoints1, image2, keypoints2,
     if not show_axis:
         plt.axis('off')
     plt.show()
+    
+def sfm_collate_fn(batch):
+    """
+    batch: list of (data0, data1, matches)
+    """
+    batch_data0 = {}
+    batch_data1 = {}
+    matches_list = []
+
+    # 所有 key
+    for key in batch[0][0]:  # data0 keys
+        batch_data0[key] = torch.stack([torch.tensor(b[0][key]) for b in batch])
+
+    for key in batch[0][1]:  # data1 keys
+        batch_data1[key] = torch.stack([torch.tensor(b[1][key]) for b in batch])
+
+    for b in batch:
+        matches_list.append(torch.tensor(b[2]))  # variable-length, keep list
+
+    return batch_data0, batch_data1, matches_list
 
 
-
-def collate_skip_none(batch):
-    # batch 是 list，每个元素是 dataset[idx] 的返回值
-    # 过滤掉 None
-    batch = [b for b in batch if b is not None]
-    if len(batch) == 0:
-        return None
-    return torch.utils.data._utils.collate.default_collate(batch)
 
 class Trainer(object):
     def __init__(self, kpnet, data_path, cpkt_save_path, num_iters):
@@ -85,7 +97,7 @@ class Trainer(object):
         camera_infos = readColmapCameras(images,cameras, test_images)
 
         self.dataset = SfMDataset(points, images, camera_infos, data_path)
-        self.data_loader = data.DataLoader(self.dataset, batch_size=8, shuffle=True,collate_fn=collate_skip_none)
+        self.data_loader = data.DataLoader(self.dataset, batch_size=8, shuffle=True,collate_fn=sfm_collate_fn)
         self.data_loader_iter = iter(self.data_loader)  # 把数据变成迭代器，方便使用next 一个一个获取
         
         self.optimizer = optim.Adam(filter(lambda x: x.requires_grad, self.kpnet.parameters()) , lr = 3e-4)
@@ -115,28 +127,16 @@ class Trainer(object):
         
         for iter in range(self.num_iters):
             try:
-                batch = next(self.data_loader_iter)
+                data0, data1, matches_list = next(self.data_loader_iter)
             except StopIteration:
                 self.data_loader_iter = iter(self.data_loader)
-                batch = next(self.data_loader_iter)
-            
-            if batch is None:  # 整个 batch 都是 None
-                continue
-            
-            data0, data1 = batch
+                data0, data1, matches_list = next(self.data_loader_iter)
             
             img0, img1 = data0["img"].to(self.device), data1["img"].to(self.device)               
             pose0_7d = pose_matrix_to_7d(data0["pose"]).to(self.device)
             pose1_7d = pose_matrix_to_7d(data1["pose"]).to(self.device) 
                         
-            positives_md_coarse = spvs_coarse_orig_res(data0, data1, scale=4)
-            positives_md_coarse = sample_fixed_points(positives_md_coarse, max_points=50)
 
-            
-            #Check if batch is corrupted with too few correspondences
-           # 检查 batch 是否太少对应点
-            if any(len(p) < 30 for p in positives_md_coarse):
-                continue
             
             # -------------------------------
             # 动态 loss 权重 warmup
@@ -157,8 +157,8 @@ class Trainer(object):
 
             loss_items = []
             
-            for b in range(len(positives_md_coarse)):
-                pts = positives_md_coarse[b]  # [S_i,4]
+            for b in range(len(matches_list)):
+                pts = matches_list[b].to(self.device)  # [S_i,4]
                 if pts.shape[0] == 0:
                     continue
 
@@ -173,9 +173,9 @@ class Trainer(object):
                 shared_featmap0, variance_map0, desc_map0, reliability_map0 = self.kpnet(img0[b].unsqueeze(0))
                 shared_featmap1, variance_map1, desc_map1, reliability_map1 = self.kpnet(img1[b].unsqueeze(0))
 
-                #img0_norm = (img0[b]/255).cpu().numpy().transpose(1,2,0) 
-                #img1_norm = (img1[b]/255).cpu().numpy().transpose(1,2,0) 
-                #plot_matched_keypoints(img0_norm,pts[:, :2], img1_norm, pts[:, 2:] )
+                img0_norm = (img0[b]/255).cpu().numpy().transpose(1,2,0) 
+                img1_norm = (img1[b]/255).cpu().numpy().transpose(1,2,0) 
+                plot_matched_keypoints(img0_norm,pts[:, :2], img1_norm, pts[:, 2:] )
                 #print("coords0 = ", pts[:, :2].shape)
                 #print("coords1 = ", pts[:,2:].shape)
 

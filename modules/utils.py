@@ -188,60 +188,20 @@ def check_accuracy(X, Y, pts1 = None, pts2 = None, plot=False):
         acc = correct.sum().item() / len(X)
         return acc
     
-def visualize_matches(X, Y, pts1, pts2, img1, img2, topk=None):
-    """
-    X, Y : descriptor (N,D)
-    pts1 : (N,2) keypoints in image1
-    pts2 : (N,2) keypoints in image2
-    img1,img2 : numpy images
-    """
 
-    with torch.no_grad():
-        # 相似度矩阵
-        sim = X @ Y.t()
+############################################
+# 3. 解析 7Scenes image name
+############################################
 
-        # 最近邻匹配
-        nn = torch.argmax(sim, dim=1)
+def parse_7scenes_image_name(name):
+    seq_str, frame_str = name.split("/")
+    seq_id = int(seq_str.split("-")[1])
+    frame_id = int(frame_str.split("-")[1].split(".")[0])
+    return seq_id, frame_id
 
-        if topk is not None:
-            sim_val, idx = torch.topk(sim.max(dim=1).values, topk)
-            pts1 = pts1[idx]
-            nn = nn[idx]
-            
-        if isinstance(pts1, torch.Tensor):
-            pts1 = pts1.detach().cpu().numpy()
-
-        if isinstance(pts2, torch.Tensor):
-            pts2 = pts2.detach().cpu().numpy()
-
-        if isinstance(img1, torch.Tensor):
-            img1 = img1.detach().cpu().numpy()
-
-        if isinstance(img2, torch.Tensor):
-            img2 = img2.detach().cpu().numpy()
-
-        nn = nn.cpu().numpy()
-
-        h1, w1 = img1.shape[:2]
-        h2, w2 = img2.shape[:2]
-
-        # 拼接两张图
-        canvas = np.zeros((max(h1,h2), w1+w2, 3), dtype=np.uint8)
-        canvas[:h1,:w1] = img1
-        canvas[:h2,w1:w1+w2] = img2
-
-        plt.figure(figsize=(10,5))
-        plt.imshow(canvas)
-
-        for i,p in enumerate(pts1):
-            x1,y1 = p
-            x2,y2 = pts2[nn[i]]
-
-            # 第二张图要偏移 w1
-            x2_shift = x2 + w1
-
-            plt.plot([x1,x2_shift],[y1,y2],'r-',linewidth=0.8)
-            plt.scatter([x1,x2_shift],[y1,y2],c='yellow',s=5)
-
-        plt.axis('off')
-        plt.show()
+def build_frame_index(images):
+    frame_index = {}
+    for img_id, img in images.items():
+        seq_id, frame_id = parse_7scenes_image_name(img.name)
+        frame_index[img_id] = {"seq": seq_id, "frame": frame_id}
+    return frame_index

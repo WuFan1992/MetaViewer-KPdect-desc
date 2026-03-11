@@ -3,6 +3,7 @@ import collections
 import struct
 import sys
 import os
+from collections import defaultdict
 
 from .utils import *
 
@@ -190,7 +191,6 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, test_images_name):
         extr = cam_extrinsics[key]
         img_name = extr.name
         
-        
         # If the img_name is in the test_images_name, put it into a test id list, other wise in a train id list
         if img_name in test_images_name:
             test_idx_list.append(extr.id)
@@ -260,3 +260,71 @@ def loadSFM(data_path):
         test_images = []
     
     return points, images, cameras, test_images
+
+############################################
+# 3 构造图像对 + sparse matches
+############################################
+
+def build_images_pairs(points_dict, images,
+                           train_ids, test_ids,
+                           frame_index,
+                           min_frame_dist=10,
+                           min_matches=30):
+
+    train_pairs = defaultdict(list)
+    test_pairs = defaultdict(list)
+
+    train_ids = set(train_ids)
+    test_ids = set(test_ids)
+
+    for p in points_dict.values():
+        img_ids = np.array(p["image_ids"], dtype=int)
+        pt2d_ids = np.array(p["point2d_ids"], dtype=int)
+        n = len(img_ids)
+        if n < 2:
+            continue
+
+        idx_i, idx_j = np.triu_indices(n, k=1)
+        imgs_i = img_ids[idx_i]
+        imgs_j = img_ids[idx_j]
+        pts_i = pt2d_ids[idx_i]
+        pts_j = pt2d_ids[idx_j]
+
+        for k in range(len(idx_i)):
+            img_i = imgs_i[k]
+            img_j = imgs_j[k]
+            if img_i not in images or img_j not in images:
+                continue
+
+            info_i = frame_index[img_i]
+            info_j = frame_index[img_j]
+
+            if info_i["seq"] == info_j["seq"] and abs(info_i["frame"] - info_j["frame"]) < min_frame_dist:
+                continue
+
+            xy_i = images[img_i].xys[pts_i[k]]
+            xy_j = images[img_j].xys[pts_j[k]]
+
+            if img_i < img_j:
+                key = (img_i, img_j)
+                match = [xy_i[0], xy_i[1], xy_j[0], xy_j[1]]
+            else:
+                key = (img_j, img_i)
+                match = [xy_j[0], xy_j[1], xy_i[0], xy_i[1]]
+
+            if img_i in train_ids and img_j in train_ids:
+                train_pairs[key].append(match)
+            elif ((img_i in train_ids and img_j in test_ids) or
+                  (img_j in train_ids and img_i in test_ids)):
+                test_pairs[key].append(match)
+            # test-test 忽略
+
+    def finalize_pairs(pairs_dict):
+        new_dict = {}
+        for k, v in pairs_dict.items():
+            arr = np.array(v, dtype=np.float32)
+            if len(arr) >= min_matches:
+                new_dict[k] = arr
+        return new_dict
+
+    return finalize_pairs(train_pairs), finalize_pairs(test_pairs)
