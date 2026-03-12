@@ -4,6 +4,7 @@ import struct
 import sys
 import os
 from collections import defaultdict
+from itertools import combinations
 
 from .utils import *
 
@@ -328,3 +329,84 @@ def build_images_pairs(points_dict, images,
         return new_dict
 
     return finalize_pairs(train_pairs), finalize_pairs(test_pairs)
+
+
+
+def build_multiview_groups(points_dict, images,
+                           train_ids, test_ids,
+                           frame_index,
+                           min_frame_dist=10):
+    """
+    构建 multi-view training groups.
+    
+    返回：
+        train_groups: list of dict, 每个 dict 包含:
+            'image_ids': [V] 图像ID列表（整数）
+            'coords': [V,2] 对应的2D点
+        test_groups: 类似
+    """
+    train_ids = set(train_ids)
+    test_ids = set(test_ids)
+
+    train_groups = []
+    test_groups = []
+
+    for p in points_dict.values():
+
+        img_ids = np.array(p["image_ids"], dtype=int)
+        pt2d_ids = np.array(p["point2d_ids"], dtype=int)
+
+        n = len(img_ids)
+        if n < 2:
+            continue
+
+        valid_imgs = []
+        valid_coords = []
+
+        for i in range(n):
+
+            img_i = int(img_ids[i])
+            if img_i not in images:
+                continue
+
+            coord_i = images[img_i].xys[pt2d_ids[i]]
+
+            valid = True
+
+            # 检查与当前 group 所有图像的 frame distance
+            for j, img_j in enumerate(valid_imgs):
+
+                info_i = frame_index[img_i]
+                info_j = frame_index[img_j]
+
+                if info_i["seq"] == info_j["seq"] and abs(info_i["frame"] - info_j["frame"]) < min_frame_dist:
+                    valid = False
+                    break
+
+            if valid:
+                valid_imgs.append(img_i)
+                valid_coords.append(coord_i)
+
+        if len(valid_imgs) < 2:
+            continue
+
+        if all(img in train_ids for img in valid_imgs):
+
+            train_groups.append({
+                "image_ids": np.array(valid_imgs, dtype=np.int64),
+                "coords": np.array(valid_coords, dtype=np.float32)
+            })
+
+    # test groups
+    for img_id in test_ids:
+
+        if img_id in images:
+
+            test_groups.append({
+                "image_ids": np.array([img_id], dtype=np.int64),
+                "coords": np.array(images[img_id].xys, dtype=np.float32)
+            })
+
+    print("len(train_dataset) =", len(train_groups))
+
+    return train_groups, test_groups

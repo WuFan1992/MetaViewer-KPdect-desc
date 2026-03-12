@@ -288,23 +288,28 @@ class VarianceKPNetModel(nn.Module):
         
     
     def reconstruction(self, pose, coords, sampled_desc, shared_feat):
-        
-        B, N, _ = coords.shape
-        # 6. sample pose features and expand to N
-        f_pose = self.pose_encoder(pose)                  # [B,pose_embed]
-        f_pose = f_pose.unsqueeze(1).expand(-1,N,-1)     # [B,N,pose_embed]
+        """
+        Single-point version: 
+        coords: [B, 2]
+        sampled_desc: [B, C]
+        shared_feat: [B, feat_dim]
+        Returns: [B, C] (backbone_pred)
+        """
+        B = coords.shape[0]
 
-        # 7. feature masking (在每个采样点)
+        # 6. sample pose features
+        f_pose = self.pose_encoder(pose)  # [B, pose_embed]
+
+        # 7. feature masking
         sampled_desc = sampled_desc * (torch.rand_like(sampled_desc) > self.feature_mask.mask_ratio)
 
-        # 8. fusion per point
-        latent = self.fusion(sampled_desc, shared_feat, coords, f_pose)  # [B,N,feat_dim]
-        latent = F.normalize(latent, dim=2)
+        # 8. fusion per point (single point)
+        latent = self.fusion(sampled_desc, shared_feat, coords, f_pose)  # [B, feat_dim]
+        latent = F.normalize(latent, dim=1)
 
-        # 9. decoder per point (reshape为1x1小图)
-        backbone_pred = self.decoder(latent.view(B*N, -1))  # [B*N,C]
-        backbone_pred = backbone_pred.view(B,N,-1)  # [B,N,C]
-        
+        # 9. decoder per point
+        backbone_pred = self.decoder(latent)  # [B, C]
+
         return backbone_pred
         
     
@@ -317,12 +322,13 @@ class VarianceKPNetModel(nn.Module):
 
         # 1. shared feature
         shared_featmap = self.backbone(img)        # [B, feat_dim, H, W]
+        
+        # 2. descriptor map (full map)
+        desc_map = self.descriptor_encoder(shared_featmap)  # [B,feat_dim,H,W]
+        desc_map = F.normalize(desc_map, dim=1)
 
         # 2. variance map (full map)
-        variance_map = self.variance_head(shared_featmap)  # [B,1,H,W]
-
-        # 3. descriptor map (full map)
-        desc_map = self.descriptor_encoder(shared_featmap)  # [B,feat_dim,H,W]
+        variance_map = self.variance_head(desc_map)  # [B,1,H,W]
         
         # 5. reliability map from descriptor
         reliability_map = self.reliability_head(desc_map)  # [B,1,H,W]

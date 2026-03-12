@@ -6,7 +6,7 @@ import os.path as osp
 import cv2
 import torch.nn.functional as F
 from skimage.io import imread
-import matplotlib.pyplot as plt
+import pickle
 # -----------------------------
 # 计算相机中心
 # -----------------------------
@@ -104,69 +104,67 @@ def load_data(base_dir, scene_info, idx):
 
 def rotation_matrix_to_quaternion(R):
     """
-    R: (N,3,3)
-    return: (N,4) quaternion (qx,qy,qz,qw)
+    R: (3,3)
+    return: (4) quaternion (qx,qy,qz,qw)
     """
 
-    m00 = R[:,0,0]
-    m01 = R[:,0,1]
-    m02 = R[:,0,2]
-    m10 = R[:,1,0]
-    m11 = R[:,1,1]
-    m12 = R[:,1,2]
-    m20 = R[:,2,0]
-    m21 = R[:,2,1]
-    m22 = R[:,2,2]
+    m00 = R[0,0]
+    m01 = R[0,1]
+    m02 = R[0,2]
+    m10 = R[1,0]
+    m11 = R[1,1]
+    m12 = R[1,2]
+    m20 = R[2,0]
+    m21 = R[2,1]
+    m22 = R[2,2]
 
     qw = torch.sqrt(torch.clamp(1 + m00 + m11 + m22, min=1e-8)) / 2
     qx = (m21 - m12) / (4 * qw)
     qy = (m02 - m20) / (4 * qw)
     qz = (m10 - m01) / (4 * qw)
 
-    q = torch.stack([qx, qy, qz, qw], dim=1)
+    q = torch.stack([qx, qy, qz, qw], dim=0)
 
     return q
 
 
 def pose_matrix_to_7d(pose):
     """
-    pose: (N,4,4)
-    return: (N,7)
+    pose: (4,4)
+    return: (7)
     """
-
-    R = pose[:, :3, :3]
-    t = pose[:, :3, 3]
+    R = pose[:3, :3]
+    t = pose[:3, 3]
 
     q = rotation_matrix_to_quaternion(R)
 
-    q = F.normalize(q, dim=1)
-    pose7 = torch.cat([q, t], dim=1)
+    q = F.normalize(q, dim=0)
+    pose7 = torch.cat([q, t], dim=0)
 
     return pose7
 
 def sample_map_at_coords(fmap, coords):
     """
-        fmap: [B, C, H, W]
-        coords: [B, N, 2]  (y, x) integer coordinates
-        return: [B, N, C]
+    fmap: [B, C, H, W]
+    coords: [B, 2]  (y, x) integer coordinates for each batch element
+    return: [B, C]
     """
     B, C, H, W = fmap.shape
-    _, N, _ = coords.shape
 
-    # 将像素坐标归一化到 [-1,1]
+    # coords 转 float 并归一化到 [-1,1]
     coords_norm = coords.clone().float()
     coords_norm[..., 1] = coords_norm[..., 1] / (W - 1) * 2 - 1  # x
     coords_norm[..., 0] = coords_norm[..., 0] / (H - 1) * 2 - 1  # y
 
-    # grid_sample 需要 [B,H_out,W_out,2]，我们想要每个点的输出就是 H_out=1, W_out=N
-    coords_norm = coords_norm.unsqueeze(1)  # [B,1,N,2]
+    # grid_sample 需要 [B, H_out, W_out, 2]，这里 H_out=1, W_out=1
+    coords_norm = coords_norm.unsqueeze(1).unsqueeze(1)  # [B, 1, 1, 2]
 
-    # [B,C,H,W] x [B,1,N,2] -> [B,C,1,N]
+    # [B, C, H, W] x [B, 1, 1, 2] -> [B, C, 1, 1]
     sampled = F.grid_sample(fmap, coords_norm, mode='bilinear', align_corners=False)
 
-    # reshape 到 [B,N,C]
-    sampled = sampled.squeeze(2).permute(0, 2, 1)  # [B,N,C]
-    return sampled 
+    # reshape 到 [B, C]
+    sampled = sampled.squeeze(3).squeeze(2)  # [B, C]
+    return sampled
 
 
 def check_accuracy(X, Y, pts1 = None, pts2 = None, plot=False):
@@ -188,10 +186,26 @@ def check_accuracy(X, Y, pts1 = None, pts2 = None, plot=False):
         acc = correct.sum().item() / len(X)
         return acc
     
+def save_pairs(train_pairs, test_pairs, save_path):
 
-############################################
-# 3. 解析 7Scenes image name
-############################################
+    data = {
+        "train_pairs": train_pairs,
+        "test_pairs": test_pairs
+    }
+
+    with open(save_path, "wb") as f:
+        pickle.dump(data, f)
+
+    print("Pairs saved to", save_path)
+    
+def load_pairs(path):
+
+    with open(path, "rb") as f:
+        data = pickle.load(f)
+
+    return data["train_pairs"], data["test_pairs"]
+    
+
 
 def parse_7scenes_image_name(name):
     seq_str, frame_str = name.split("/")

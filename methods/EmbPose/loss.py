@@ -1,6 +1,6 @@
 import torch
 import torch.nn.functional as F
-
+from modules.utils import sample_map_at_coords
 
 def pose_difference(T1, T2, alpha=1.0, beta=1.0):
     """
@@ -29,168 +29,69 @@ def pose_difference(T1, T2, alpha=1.0, beta=1.0):
 
     return pose_diff
 
-def variance_loss_pose_aware_single(
-    desc1_pts,         # [N,C]  source descriptors
-    desc2_pts,         # [N,C]  target descriptors
-    var1_pred,         # [N]    predicted variance for source
-    var2_pred,         # [N]    predicted variance for target
-    pose1,             # [4,4]  source pose
-    pose2,             # [4,4]  target pose
-    reliability1=None, # [N] optional
-    reliability2=None, # [N] optional
-    alpha=1.0,
-    beta=1.0,
-    detach_desc_diff=True,
-    min_weight=0.1
-):
+def variance_loss_multi_view(var_pred, desc_list):
     """
-    Pose-aware variance loss with early-stage stabilization.
-    """
-    # 1. 计算 pose 差异
-    pose_diff = pose_difference(pose1, pose2, alpha, beta)  # scalar
-    pose_diff_norm = pose_diff / (alpha + beta + 1e-6)
-
-    # 2. descriptor 差异
-    desc_diff = ((desc1_pts - desc2_pts) ** 2).sum(dim=1)  # [N]
-    if detach_desc_diff:
-        desc_diff = desc_diff.detach()  # early stage 不让梯度通过 desc_diff
-
-    # 3. 归一化权重 + clamp 最小值
-    weight = torch.exp(-pose_diff_norm) * (desc_diff / (desc_diff.max() + 1e-8) + 1e-6)
-    weight = torch.clamp(weight, min=min_weight)  # 避免 early stage 权重过小
-
-    # 4. reliability 加权
-    if reliability1 is not None:
-        weight = weight * reliability1
-    if reliability2 is not None:
-        weight = weight * reliability2
-
-    # 5. log-variance + L2 loss 避免 collapse
-    loss1 = (weight * (torch.log(var1_pred + 1e-6) - torch.log(desc_diff + 1e-6)) ** 2).mean()
-    loss2 = (weight * (torch.log(var2_pred + 1e-6) - torch.log(desc_diff + 1e-6)) ** 2).mean()
-
-    return (loss1 + loss2) / 2.0
-
-
-def variance_loss_pose_aware(
-    desc_map1,          # [B,C,H,W]  source image descriptor map
-    desc_map2,          # [B,C,H,W]  target image descriptor map
-    variance_map,       # [B,1,H,W]  predicted variance map (source)
-    coords1,            # [B,N,2]    source pixel coordinates (y,x)
-    coords2,            # [B,N,2]    target corresponding pixel coordinates (y,x)
-    pose1,              # [B,4,4] source pose
-    pose2,              # [B,4,4] target pose
-    reliability_map=None # [B,1,H,W] optional
-):
-    """
-    Compute variance loss for a single pair of images with pose-aware weighting
-    and optional reliability weighting.
+    var_pred: [V,N]
+    desc_list: list of descriptors [V,N,C]
     """
 
-    B, C, H, W = desc_map1.shape
-    _, N, _ = coords1.shape
-    device = desc_map1.device
+    desc_stack = torch.stack(desc_list, dim=0)   # [V,N,C]
 
-    loss = 0.0
+    mean_desc = desc_stack.mean(dim=0)
 
-    # 1. compute pose difference
-    pose_diff =  pose_difference(pose1, pose2)
-    pose_diff_norm = pose_diff / (pose_diff.max() + 1e-8) # normalize to [0,1]
+    var_gt = ((desc_stack - mean_desc)**2).sum(-1).mean(0)
 
-    for b in range(B):
-        y1 = coords1[b,:,0]
-        x1 = coords1[b,:,1]
-        y2 = coords2[b,:,0]
-        x2 = coords2[b,:,1]
+    var_gt = var_gt.detach()
 
-        # 2. sample descriptors at corresponding coordinates
-        desc1_pts = desc_map1[b, :, y1, x1].T  # [N,C]
-        desc2_pts = desc_map2[b, :, y2, x2].T  # [N,C]
+    var_pred = var_pred.mean(0)
 
-        # 3. compute descriptor difference
-        desc_diff = ((desc1_pts - desc2_pts)**2).sum(dim=1)  # [N]
+    loss = var_gt / (var_pred + 1e-6) + torch.log(var_pred + 1e-6)
 
-        # 4. adaptive weight based on pose difference
-        # smaller pose_diff -> weight larger
-        weight = torch.exp(-pose_diff_norm[b]) * (desc_diff / (desc_diff.max()+1e-8) + 1e-6)  # [N]
+    return loss.mean()
 
-        # 5. optional reliability weighting
-        if reliability_map is not None:
-            weight = weight * reliability_map[b,0,y1,x1]  # [N]
+def soft_patch_matching(desc_i, desc_map_j, coords_j, patch=3):
 
-        # 6. predicted variance for source pixels
-        var_pred = variance_map[b,0,y1,x1]  # [N]
+    B, C = desc_i.shape
 
-        # 7. weighted MSE
-        loss += (weight * (var_pred - desc_diff)**2).mean()
+    pad = patch // 2
 
-    return loss / B
+    patches = []
 
+    for dy in range(-pad, pad+1):
+        for dx in range(-pad, pad+1):
 
-"""
-def dual_softmax_loss(X, Y, temp = 0.2):
-    if X.size() != Y.size() or X.dim() != 2 or Y.dim() != 2:
-        raise RuntimeError('Error: X and Y shapes must match and be 2D matrices')
+            offset = coords_j.clone()
 
-    dist_mat = (X @ Y.t()) * temp
-    conf_matrix12 = F.log_softmax(dist_mat, dim=1)
-    conf_matrix21 = F.log_softmax(dist_mat.t(), dim=1)
+            offset[:,0] += dy
+            offset[:,1] += dx
 
-    with torch.no_grad():
-        conf12 = torch.exp( conf_matrix12 ).max(dim=-1)[0]
-        conf21 = torch.exp( conf_matrix21 ).max(dim=-1)[0]
-        conf = conf12 * conf21
+            p = sample_map_at_coords(desc_map_j, offset)
 
-    target = torch.arange(len(X), device = X.device)
+            patches.append(p)
 
-    loss = F.nll_loss(conf_matrix12, target) + \
-           F.nll_loss(conf_matrix21, target)
+    patch_desc = torch.stack(patches, dim=1)  # [B,K,C]
 
-    return loss, conf
-    """
-def dual_softmax_loss(X, Y, temp=0.3, hard_negative_k=5):
-    """
-    X, Y: [N, C] descriptors
-    temp: softmax temperature
-    hard_negative_k: top-K hard negatives to emphasize
-    """
-    # L2-normalize descriptors
-    X = F.normalize(X, dim=1)
-    Y = F.normalize(Y, dim=1)
+    sim = torch.einsum("bc,bkc->bk", desc_i, patch_desc)
 
-    # cosine similarity
-    sim_matrix = X @ Y.t()  # [N, N]
-    sim_matrix = sim_matrix / temp
+    prob = F.log_softmax(sim, dim=1)
 
-    # Hard-negative emphasis: top-K largest non-diagonal similarities
-    N = X.shape[0]
-    mask = torch.eye(N, device=X.device).bool()
-    hard_neg_values, _ = torch.topk(sim_matrix.masked_fill(mask, -1e9), k=hard_negative_k, dim=1)
-    hard_neg_weight = torch.mean(hard_neg_values, dim=1, keepdim=True)  # [N,1]
-    sim_matrix = sim_matrix - hard_neg_weight  # 强调 hard negatives
+    center = patch_desc.shape[1] // 2
 
-    # log-softmax
-    log_prob12 = F.log_softmax(sim_matrix, dim=1)
-    log_prob21 = F.log_softmax(sim_matrix.t(), dim=1)
+    loss = -prob[:,center].mean()
 
-    # target
-    target = torch.arange(N, device=X.device)
-
-    loss = F.nll_loss(log_prob12, target) + F.nll_loss(log_prob21, target)
-
-    # confidence for reliability
-    with torch.no_grad():
-        conf12 = torch.exp(log_prob12).max(dim=-1)[0]
-        conf21 = torch.exp(log_prob21).max(dim=-1)[0]
-        conf = conf12 * conf21
+    conf = prob.exp().max(-1)[0]
 
     return loss, conf
 
-def reliability_loss(heatmap, target):
-    # Compute L1 loss
-    target = target.unsqueeze(0).unsqueeze(-1)
-    L1_loss = F.l1_loss(heatmap, target)
-    return L1_loss 
+
+# 注意这里的输入发生变化，不再时target 而时confidence
+def reliability_loss(pred, conf):
+
+    conf = conf.detach()
+
+    conf = (conf > 0.5).float()
+
+    return F.binary_cross_entropy(pred.squeeze(), conf)
 
 
 
@@ -203,5 +104,12 @@ def reconstr_loss(ori, rec):
     diff = ori - rec
     reconstr_loss = torch.norm(diff, dim=2).mean()
     return reconstr_loss
+
+def variance_smooth_loss(var):
+
+    dx = torch.abs(var[:,:,1:,:] - var[:,:,:-1,:])
+    dy = torch.abs(var[:,:,:,1:] - var[:,:,:,:-1])
+
+    return dx.mean() + dy.mean()
 
 

@@ -4,6 +4,7 @@ import torch.utils.data as data
 from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
 import time
+import matplotlib.pyplot as plt
 
 from modules.sfm_dataset import SfMDataset
 from modules.sfm_loader import *
@@ -116,14 +117,13 @@ class Trainer(object):
         # -------------------------------
         w_rec_init = 0.05
         w_ds_init  = 0.05
-        w_kp_init  = 0.5   # 早期 reliability 低，防止梯度塌
+        w_kp_init  = 0.05   # 早期 reliability 低，防止梯度塌
         w_var_init = 1    # early stage 保持 small weight
 
-        w_rec_max = 0.2
-        w_ds_max  = 0.05
-        w_kp_max  = 50
-        w_var_max = 500
-    
+        w_rec = 0.1
+        w_desc = 0.05
+        w_kp = 1
+        w_var = 10
         
         for iter in range(self.num_iters):
             try:
@@ -173,11 +173,11 @@ class Trainer(object):
                 shared_featmap0, variance_map0, desc_map0, reliability_map0 = self.kpnet(img0[b].unsqueeze(0))
                 shared_featmap1, variance_map1, desc_map1, reliability_map1 = self.kpnet(img1[b].unsqueeze(0))
 
-                img0_norm = (img0[b]/255).cpu().numpy().transpose(1,2,0) 
-                img1_norm = (img1[b]/255).cpu().numpy().transpose(1,2,0) 
-                plot_matched_keypoints(img0_norm,pts[:, :2], img1_norm, pts[:, 2:] )
-                #print("coords0 = ", pts[:, :2].shape)
-                #print("coords1 = ", pts[:,2:].shape)
+                # Visualize the gt matching
+                #img0_norm = (img0[b]/255).cpu().numpy().transpose(1,2,0) 
+                #img1_norm = (img1[b]/255).cpu().numpy().transpose(1,2,0) 
+                #plot_matched_keypoints(img0_norm,pts[:, :2], img1_norm, pts[:, 2:] )
+
 
                 sampled_desc0 = sample_map_at_coords(desc_map0, coords0)
                 sampled_desc1 = sample_map_at_coords(desc_map1, coords1)
@@ -254,9 +254,142 @@ class Trainer(object):
             self.writer.add_scalar('Loss/recontruction', loss_rec_w, iter)
             self.writer.add_scalar('Loss/reliability', loss_kp_w, iter)
             self.writer.add_scalar('Loss/variance', loss_var, iter)
+
+
+def sfm_collate_fn(batch):
+    return batch  # batch 是 list，每个元素就是 dict
+
+class TrainerMultiView:
+    def __init__(self, kpnet, datapath, cpkt_save_path, num_iters, top_k=4096, device=None):
+        self.device = device if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.kpnet = kpnet.to(self.device)
+        
+        points,images, cameras, test_images = loadSFM(datapath)
+        camera_infos = readColmapCameras(images,cameras, test_images)
+
+        self.dataset = SfMDataset(points, images, camera_infos, datapath)
+        self.data_loader = torch.utils.data.DataLoader(
+            self.dataset, batch_size=1, shuffle=True, collate_fn=sfm_collate_fn
+        )
+        self.optimizer = torch.optim.Adam(
+            filter(lambda x: x.requires_grad, self.kpnet.parameters()), lr=3e-4
+        )
+        self.scheduler = torch.optim.lr_scheduler.StepLR(self.optimizer, step_size=30000, gamma=0.5)
+        self.num_iters = num_iters
+        self.cpkt_save_path = cpkt_save_path
+        self.top_k = top_k
+        
+        self.progress_bar = tqdm(range(0, self.num_iters), desc="Training progress")
+
+    def compute_multi_view_variance(self, desc_list):
+        """
+        desc_list: list of [N,C], length=V
+        """
+        desc_stack = torch.stack(desc_list, dim=0)  # [V,N,C]
+        mean_desc = desc_stack.mean(0)
+        var_gt = ((desc_stack - mean_desc)**2).sum(-1).mean(0)
+        return var_gt.detach()
+
+    def train_iters(self, V=5, patch=3):
+        self.kpnet.train()
+        data_iter = iter(self.data_loader)
+
+        for iter_idx in range(self.num_iters):
+            try:
+                batch_data = [next(data_iter) for _ in range(V)]
+            except StopIteration:
+                data_iter = iter(self.data_loader)
+                batch_data = [next(data_iter) for _ in range(V)]
             
+
+            # batch_data[v] 是 list, batch_size=1
+            batch_data = [b[0] for b in batch_data]  # 去掉最外层 list
+
+            # 读取 image_ids 和 coords
+            all_image_ids = [b['image_ids'].to(self.device) for b in batch_data]  # [V, num_sample]
+            all_coords = [b['coords'].to(self.device) for b in batch_data]        # [V, num_sample,2]
+
+            # 读取图像并计算 descriptor
+            imgs = []
+            poses = [] 
+            for v in range(V):
+                img_batch = []
+                pose_batch = []
+                for img_id in all_image_ids[v]:
+                    img = self.dataset.get_img(img_id.item()).to(self.device)
+                    pose = self.dataset.get_pose(img_id).to(self.device)
+                    pose = pose_matrix_to_7d(pose)
+                    img_batch.append(img)
+                    pose_batch.append(pose)
+                imgs.append(torch.stack(img_batch, dim=0))  # [num_sample, C,H,W]
+                poses.append(torch.stack(pose_batch, dim=0))  # [num_sample, pose_dim]
+                
+            # 假设 kpnet.forward(imgs) 返回 shared_feats, desc_maps, variance_maps, reliability_maps
+            shared_feats, desc_maps, variance_maps, reliability_maps = [], [], [], []
+            for v in range(V):
+                sf, var, desc, rel = self.kpnet(imgs[v])  # imgs[v]: [num_sample,C,H,W]
+                shared_feats.append(sf)
+                desc_maps.append(desc)
+                variance_maps.append(var)
+                reliability_maps.append(rel)
+
+            # 对每个 3D 点采样 descriptor & variance
+            # 这里假设每个 3D 点在不同图像上对应 coords
+            desc_list, var_list, rel_list = [], [], []
+            for v in range(V):
+                # sample_map_at_coords(desc_map, coords) 返回 [num_sample, C]
+                desc_list.append(sample_map_at_coords(desc_maps[v], all_coords[v]))
+                var_list.append(sample_map_at_coords(variance_maps[v], all_coords[v]))
+                rel_list.append(sample_map_at_coords(reliability_maps[v], all_coords[v]))
+
+            # Multi-view variance supervision
+            var_gt = self.compute_multi_view_variance(desc_list)
+            var_pred = torch.stack(var_list).mean(0)
+            loss_var = (var_gt / (var_pred + 1e-6) + torch.log(var_pred + 1e-6)).mean()
+
+            # Multi-view soft patch matching
+            loss_ds, conf_all = 0, []
+            for i in range(V):
+                for j in range(V):
+                    if i != j:
+                        l, conf = soft_patch_matching(desc_list[i], desc_maps[j], all_coords[j], patch=patch)
+                        loss_ds += l
+                        conf_all.append(conf)
+            loss_ds /= V*(V-1)
+            conf_target = torch.stack(conf_all).mean(0)
+
+            # Reliability supervision
+            loss_kp = sum([reliability_loss(rel_list[v], conf_target) for v in range(V)]) / V
+
+            # Reconstruction loss
+            loss_rec = 0
+            for v in range(V):
+                backbone_pred = self.kpnet.reconstruction(
+                    poses[v], all_coords[v], desc_list[v].unsqueeze(0), shared_feats[v]
+                )
+                sampled_backbone = sample_map_at_coords(shared_feats[v], all_coords[v])
+                loss_rec += cross_view_recon_loss(backbone_pred, sampled_backbone)
+            loss_rec /= V
+
+            # 总 loss
+            w_var, w_ds, w_kp, w_rec = 0.01, 0.05, 5, 0.2
+            loss = w_var*loss_var + w_ds*loss_ds + w_kp*loss_kp + w_rec*loss_rec
+
             
+            # backward
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.kpnet.parameters(), 1.0)
+            self.optimizer.step()
+            self.optimizer.zero_grad()
+            self.scheduler.step()
+
+            self.progress_bar.set_description(f"[Iter {iter_idx}] loss:{loss.item():.4f} var:{loss_var.item():.4f} ds:{loss_ds.item():.4f} kp:{loss_kp.item():.4f} rec:{loss_rec.item():.4f}")
+
+            # 10. 定期保存 checkpoint
+            if iter_idx % 2000 == 0 and self.cpkt_save_path is not None:
+                torch.save(self.kpnet.state_dict(), f"{self.cpkt_save_path}/kpnet_iter_{iter_idx}.pth")
             
+            self.progress_bar.update(1)
             
 
 
@@ -274,7 +407,7 @@ if __name__ == "__main__":
     cpkt_save_path = "checkpoints/"
     num_iters = 2000
     variance_kpnet = VarianceKPNetModel(in_channels=64, pose_dim=7, feature_dim=64, pose_embed=64)
-    trainer = Trainer(variance_kpnet, data_path, cpkt_save_path, num_iters)
+    trainer = TrainerMultiView(variance_kpnet, data_path, cpkt_save_path, num_iters)
     trainer.train_iters()
 
 
