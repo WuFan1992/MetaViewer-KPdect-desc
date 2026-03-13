@@ -143,27 +143,30 @@ def pose_matrix_to_7d(pose):
 
     return pose7
 
-def sample_map_at_coords(fmap, coords):
+def sample_map_at_coords(fmap, coords, H_orig, W_orig):
     """
-    fmap: [B, C, H, W]
-    coords: [B, 2]  (y, x) integer coordinates for each batch element
+    fmap: [B, C, Hf, Wf]
+    coords: [B, 2] (y,x) 原图坐标
+    H_orig, W_orig: 原图大小
     return: [B, C]
     """
-    B, C, H, W = fmap.shape
+    print("")
+    B, C, Hf, Wf = fmap.shape
 
-    # coords 转 float 并归一化到 [-1,1]
-    coords_norm = coords.clone().float()
-    coords_norm[..., 1] = coords_norm[..., 1] / (W - 1) * 2 - 1  # x
-    coords_norm[..., 0] = coords_norm[..., 0] / (H - 1) * 2 - 1  # y
+    # 缩放到 feature map 尺寸
+    coords_scaled = coords.clone().float()
+    coords_scaled[:, 0] = coords_scaled[:, 0] * (Hf / H_orig)
+    coords_scaled[:, 1] = coords_scaled[:, 1] * (Wf / W_orig)
 
-    # grid_sample 需要 [B, H_out, W_out, 2]，这里 H_out=1, W_out=1
-    coords_norm = coords_norm.unsqueeze(1).unsqueeze(1)  # [B, 1, 1, 2]
+    # 归一化到 [-1,1] for grid_sample
+    coords_norm = coords_scaled.clone()
+    coords_norm[..., 1] = coords_norm[..., 1] / (Wf - 1) * 2 - 1
+    coords_norm[..., 0] = coords_norm[..., 0] / (Hf - 1) * 2 - 1
 
-    # [B, C, H, W] x [B, 1, 1, 2] -> [B, C, 1, 1]
+    coords_norm = coords_norm.unsqueeze(1).unsqueeze(1)  # [B,1,1,2]
+
     sampled = F.grid_sample(fmap, coords_norm, mode='bilinear', align_corners=False)
-
-    # reshape 到 [B, C]
-    sampled = sampled.squeeze(3).squeeze(2)  # [B, C]
+    sampled = sampled.squeeze(3).squeeze(2)  # [B,C]
     return sampled
 
 

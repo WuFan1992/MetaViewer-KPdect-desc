@@ -29,27 +29,10 @@ def pose_difference(T1, T2, alpha=1.0, beta=1.0):
 
     return pose_diff
 
-def variance_loss_multi_view(var_pred, desc_list):
-    """
-    var_pred: [V,N]
-    desc_list: list of descriptors [V,N,C]
-    """
 
-    desc_stack = torch.stack(desc_list, dim=0)   # [V,N,C]
 
-    mean_desc = desc_stack.mean(dim=0)
-
-    var_gt = ((desc_stack - mean_desc)**2).sum(-1).mean(0)
-
-    var_gt = var_gt.detach()
-
-    var_pred = var_pred.mean(0)
-
-    loss = var_gt / (var_pred + 1e-6) + torch.log(var_pred + 1e-6)
-
-    return loss.mean()
-
-def soft_patch_matching(desc_i, desc_map_j, coords_j, patch=3):
+def soft_patch_matching(desc_i, desc_map_j, coords_j, H_ori, W_ori,patch=3):
+    
 
     B, C = desc_i.shape
 
@@ -65,7 +48,7 @@ def soft_patch_matching(desc_i, desc_map_j, coords_j, patch=3):
             offset[:,0] += dy
             offset[:,1] += dx
 
-            p = sample_map_at_coords(desc_map_j, offset)
+            p = sample_map_at_coords(desc_map_j, offset, H_ori, W_ori)
 
             patches.append(p)
 
@@ -80,6 +63,7 @@ def soft_patch_matching(desc_i, desc_map_j, coords_j, patch=3):
     loss = -prob[:,center].mean()
 
     conf = prob.exp().max(-1)[0]
+    
 
     return loss, conf
 
@@ -95,15 +79,53 @@ def reliability_loss(pred, conf):
 
 
 
-def cross_view_recon_loss(pred_feat, target_feat):
-    loss = F.l1_loss(pred_feat, target_feat)
+def cross_view_recon_loss(backbone_pred, target_feat, eps=1e-6):
+    """
+    backbone_pred: [B, C]
+    target_feat:  [B, C]
+    """
+    # L2 normalize
+    pred_norm = F.normalize(backbone_pred, dim=1)
+    target_norm = F.normalize(target_feat, dim=1)
+    
+    # 余弦相似度
+    cos_sim = (pred_norm * target_norm).sum(dim=1)  # [B]
+    
+    # loss = 1 - mean cosine similarity
+    loss = 1 - cos_sim.mean()
     return loss
 
 
-def reconstr_loss(ori, rec):
-    diff = ori - rec
-    reconstr_loss = torch.norm(diff, dim=2).mean()
-    return reconstr_loss
+
+def variance_loss(desc_list, var_list):
+    """
+    desc_list: list of [N,C]
+    var_list:  list of [N,1]
+    """
+
+    V = len(desc_list)
+
+    loss = 0
+    count = 0
+
+    for i in range(V):
+        for j in range(V):
+
+            if i == j:
+                continue
+
+            desc_i = desc_list[i].detach()
+            desc_j = desc_list[j].detach()
+
+            var = var_list[i].squeeze()
+
+            dist = ((desc_i - desc_j)**2).sum(-1)
+
+            loss += (dist / (var + 1e-6) + torch.log(var + 1e-6)).mean()
+
+            count += 1
+
+    return loss / count
 
 def variance_smooth_loss(var):
 
@@ -111,5 +133,96 @@ def variance_smooth_loss(var):
     dy = torch.abs(var[:,:,:,1:] - var[:,:,:,:-1])
 
     return dx.mean() + dy.mean()
+
+def compute_relative_view_variance(poses_src, poses_tgt, scale_angle=1.0):
+    """
+    poses_src, poses_tgt: [B,4,4] 相机pose矩阵
+    return: var_gt_view: [B], 用作variance supervision的目标
+    """
+    R_src = poses_src[:, :3, :3]   # [B,3,3]
+    R_tgt = poses_tgt[:, :3, :3]   # [B,3,3]
+
+    # 相对旋转矩阵
+    R_rel = torch.matmul(R_tgt, R_src.transpose(1,2))  # [B,3,3]
+
+    # 计算旋转角度 acos((trace(R)-1)/2)
+    trace = R_rel[:,0,0] + R_rel[:,1,1] + R_rel[:,2,2]  # [B]
+    angle = torch.acos(torch.clamp((trace - 1)/2, -1.0, 1.0))  # [B]
+
+    # scale成合适范围
+    var_gt_view = scale_angle * angle
+
+    return var_gt_view  # [B]
+
+def viewpoint_guided_variance_loss(var_tensor, poses_tensor):
+        """
+        var_list: list of [N,1] 每个 view 的 variance prediction
+        poses: list of [B,4,4] 每个 view 的相机 pose
+        V: view 数量
+        """
+        num_sample = var_tensor[0].shape[0]
+        loss_var = 0
+        for v in range(num_sample):
+            for u in range(num_sample):
+                if u == v:
+                    continue
+
+                # 1. 计算相对旋转角度
+                var_gt_view = compute_relative_view_variance(
+                    poses_src=poses_tensor[:,u],
+                    poses_tgt=poses_tensor[:,v],
+                    scale_angle=1.0
+                )  # [num_sample]
+
+                # 2. 取源视角预测的 variance
+                var_pred = var_tensor[:,u].squeeze()  # [num_sample]
+
+                # 3. heteroscedastic loss
+                loss_var += (var_gt_view / (var_pred + 1e-6) + torch.log(var_pred + 1e-6)).mean()
+        print("var_pred min/max:", var_pred.min().item(), var_pred.max().item())
+        print("var_gt_view min/max:", var_gt_view.min().item(), var_gt_view.max().item())
+        # 归一化
+        loss_var /= num_sample*(num_sample-1)
+
+        return loss_var
+    
+def fused_variance_loss(self, desc_list, var_list, poses, V, w_desc=0.1):
+    """
+    计算融合 viewpoint-guided 和 descriptor-guided 的 variance loss
+    
+    desc_list: list of [N, C] 每个 view 的 descriptor
+    var_list: list of [N, 1] 每个 view 的预测 variance
+    poses: list of [B, 4, 4] 每个 view 的相机 pose
+    V: view 数量
+    w_desc: descriptor-based variance 权重
+    """
+    loss_view = 0
+    loss_desc = 0
+    
+    for v in range(V):
+        for u in range(V):
+            if u == v:
+                continue
+            
+            # ----- 1. viewpoint-guided variance -----
+            var_gt_view = compute_relative_view_variance(
+                poses_src=poses[u],
+                poses_tgt=poses[v],
+                scale_angle=1.0
+            )  # [N]
+            var_pred = var_list[u].squeeze()  # [N]
+            loss_view += (var_gt_view / (var_pred + 1e-6) + torch.log(var_pred + 1e-6)).mean()
+            
+            # ----- 2. descriptor-guided variance -----
+            desc_gt_diff = ((desc_list[u] - desc_list[v])**2).sum(-1)  # L2 差 [N]
+            loss_desc += (desc_gt_diff / (var_pred + 1e-6) + torch.log(var_pred + 1e-6)).mean()
+    
+    # 归一化
+    loss_view /= V*(V-1)
+    loss_desc /= V*(V-1)
+    
+    # 总 loss
+    loss_var = loss_view + w_desc * loss_desc
+    return loss_var
 
 

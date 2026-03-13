@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.models as models
+from .utils import *
 
 
 # -------------------------
@@ -74,7 +75,7 @@ class DescriptorEncoder(nn.Module):
 # -------------------------
 
 class VarianceHead(nn.Module):
-    def __init__(self, feat_dim=128, epsilon=1e-2):
+    def __init__(self, feat_dim=128, epsilon=0.05):
         super().__init__()
         self.epsilon = epsilon
         self.net = nn.Sequential(
@@ -118,7 +119,7 @@ class ReliabilityHead(nn.Module):
 # -------------------------
 
 class PoseEncoder(nn.Module):
-    def __init__(self, pose_dim=7, pose_embed=64):
+    def __init__(self, pose_dim=9, pose_embed=64):
         super().__init__()
 
         self.mlp = nn.Sequential(
@@ -132,127 +133,57 @@ class PoseEncoder(nn.Module):
     def forward(self, pose):
 
         return self.mlp(pose)
+    
+class FiLMModulation(nn.Module):
 
-
-# -------------------------
-# Patch-based Pose Attention Fusion
-# -------------------------
-class PatchPoseAttentionFusion(nn.Module):
-    def __init__(self, desc_dim=64, pose_dim=64, num_heads=4, patch_size=5):
+    def __init__(self, pose_dim=128, feat_dim=64):
         super().__init__()
-        self.desc_dim = desc_dim
-        self.pose_dim = pose_dim
-        self.num_heads = num_heads
-        self.patch_size = patch_size
-        self.pad = patch_size // 2
 
-        # multi-head projections
-        self.q_proj = nn.Linear(desc_dim, desc_dim)
-        self.k_proj = nn.Linear(desc_dim, desc_dim)
-        self.v_proj = nn.Linear(desc_dim, desc_dim)
+        self.mlp = nn.Sequential(
 
-        # pose modulation
-        self.pose_fc = nn.Linear(pose_dim, desc_dim)
+            nn.Linear(pose_dim, 128),
+            nn.ReLU(inplace=True),
 
-        self.out_fc = nn.Linear(desc_dim, desc_dim)
+            nn.Linear(128, feat_dim * 2)
+        )
 
-    def forward(self, desc_points, shared_feat_map, coords, pose_embed):
+    def forward(self, feat, pose_embed):
+
         """
-        desc_points: [B, N, C]
-        shared_feat_map: [B, C, H, W]
-        coords: [B, N, 2]  (y, x)
-        pose_embed: [B, pose_dim]
+        feat: [B,C]
+        pose_embed: [B,pose_dim]
         """
-        B, N, C = desc_points.shape
-        H, W = shared_feat_map.shape[2], shared_feat_map.shape[3]
 
-        device = desc_points.device
+        gamma_beta = self.mlp(pose_embed)
 
-        # --------- 1. 提取 patch 特征 ---------
-        # pad fmap
-        padded_feat = F.pad(shared_feat_map, (self.pad, self.pad, self.pad, self.pad))  # [B,C,H+2*pad,W+2*pad]
+        gamma, beta = gamma_beta.chunk(2, dim=1)
 
-        # 生成 patch 坐标偏移
-        offsets = torch.arange(-self.pad, self.pad+1, device=device)
-        dy, dx = torch.meshgrid(offsets, offsets, indexing='ij')  # [patch,patch]
-        dy = dy.flatten()
-        dx = dx.flatten()
-        K = self.patch_size ** 2
+        out = gamma * feat + beta
 
-        # 扩展 coords
-        y = coords[..., 0].unsqueeze(-1) + dy.view(1,1,-1)  # [B,N,K]
-        x = coords[..., 1].unsqueeze(-1) + dx.view(1,1,-1)  # [B,N,K]
+        return out
 
-        # clamp 防止越界
-        y = y.clamp(0, H + 2*self.pad - 1)
-        x = x.clamp(0, W + 2*self.pad - 1)
 
-        # long 类型索引
-        y = y.long()
-        x = x.long()
 
-        # 生成 batch index
-        b_idx = torch.arange(B, device=device).view(B,1,1).expand(-1,N,K)  # [B,N,K]
-
-        # gather
-        patch_feats = padded_feat[b_idx, :, y, x]  # [B,N,K,C] ??? 需要 permute
-        patch_feats = patch_feats.permute(0,1,3,2)  # [B,N,C,K]
-        patch_feats = patch_feats.mean(dim=-1)      # [B,N,C] 取 patch 平均
-
-        # --------- 2. multi-head attention ---------
-        q = self.q_proj(desc_points).view(B,N,self.num_heads,C//self.num_heads).transpose(1,2)  # [B,heads,N,head_dim]
-        k = self.k_proj(patch_feats).view(B,N,self.num_heads,C//self.num_heads).transpose(1,2)
-        v = self.v_proj(patch_feats).view(B,N,self.num_heads,C//self.num_heads).transpose(1,2)
-
-        attn_scores = torch.matmul(q, k.transpose(-2,-1)) / (C//self.num_heads)**0.5  # [B,heads,N,N]
-        attn_probs = F.softmax(attn_scores, dim=-1)
-        attn_out = torch.matmul(attn_probs, v)  # [B,heads,N,head_dim]
-        attn_out = attn_out.transpose(1,2).contiguous().view(B,N,C)  # [B,N,C]
-
-        # --------- 3. pose modulation (FiLM) ---------
-        pose_mod = self.pose_fc(pose_embed).unsqueeze(1)  # [B,1,C]
-        fused = attn_out * (1 + pose_mod)                  # FiLM-like modulation
-
-        # --------- 4. output projection ---------
-        fused = self.out_fc(fused)  # [B,N,C]
-
-        return fused
 # -------------------------
 # Simple per-point decoder
 # -------------------------
 class PointDecoder(nn.Module):
-    def __init__(self, feat_dim=128, out_dim=64):
-        super().__init__()
-        self.fc = nn.Linear(feat_dim, out_dim)
 
-    def forward(self, x):
-        """
-        x: [B*N, feat_dim]
-        return: [B*N, out_dim]
-        """
-        return self.fc(x)
-
-# -------------------------
-# Spatial Feature Masking
-# -------------------------
-
-class SpatialFeatureMasking(nn.Module):
-
-    def __init__(self, mask_ratio=0.2):
+    def __init__(self, feat_dim=64):
         super().__init__()
 
-        self.mask_ratio = mask_ratio
+        self.net = nn.Sequential(
+
+            nn.Linear(feat_dim, feat_dim),
+            nn.ReLU(inplace=True),
+
+            nn.Linear(feat_dim, feat_dim)
+        )
 
     def forward(self, x):
 
-        if not self.training:
-            return x
+        return self.net(x)
 
-        B, C, H, W = x.shape
-
-        mask = torch.rand(B,1,H,W,device=x.device) > self.mask_ratio
-
-        return x * mask
 
 
 # -------------------------
@@ -263,9 +194,9 @@ class VarianceKPNetModel(nn.Module):
 
     def __init__(self,
                  in_channels=64,
-                 pose_dim=7,
+                 pose_dim=9,
                  feature_dim=64,
-                 pose_embed=64):
+                 pose_embed=128):
         super().__init__()
 
         # backbone
@@ -278,39 +209,43 @@ class VarianceKPNetModel(nn.Module):
         self.reliability_head = ReliabilityHead(feature_dim)
         self.variance_head = VarianceHead(feature_dim)
 
-        # masking
-        self.feature_mask = SpatialFeatureMasking(0.2)
 
         # pose modules
         self.pose_encoder = PoseEncoder(pose_dim, pose_embed)
-        self.fusion = PatchPoseAttentionFusion(desc_dim=feature_dim, pose_dim=pose_embed)
-        self.decoder = PointDecoder(feat_dim=feature_dim, out_dim=in_channels)
+
+        # FiLM
+        self.film = FiLMModulation(pose_embed, feature_dim)
+
+        # decoder
+        self.decoder = PointDecoder(feature_dim)
         
     
-    def reconstruction(self, pose, coords, sampled_desc, shared_feat):
+    def reconstruction(self,
+                   desc_src,
+                   pose_src,
+                   pose_tgt):
         """
-        Single-point version: 
-        coords: [B, 2]
-        sampled_desc: [B, C]
-        shared_feat: [B, feat_dim]
-        Returns: [B, C] (backbone_pred)
+        desc_src: [B,C]
+        pose_src: [B,4,4]
+        pose_tgt: [B,4,4]
         """
-        B = coords.shape[0]
 
-        # 6. sample pose features
-        f_pose = self.pose_encoder(pose)  # [B, pose_embed]
+        # relative pose
+        pose_ij = pose_matrix_to_9d(pose_src, pose_tgt)
 
-        # 7. feature masking
-        sampled_desc = sampled_desc * (torch.rand_like(sampled_desc) > self.feature_mask.mask_ratio)
+        pose_embed = self.pose_encoder(pose_ij)
 
-        # 8. fusion per point (single point)
-        latent = self.fusion(sampled_desc, shared_feat, coords, f_pose)  # [B, feat_dim]
+        # FiLM modulation
+        latent = self.film(desc_src, pose_embed)
+
         latent = F.normalize(latent, dim=1)
 
-        # 9. decoder per point
-        backbone_pred = self.decoder(latent)  # [B, C]
+        # decoder
+        pred_desc = self.decoder(latent)
 
-        return backbone_pred
+        pred_desc = F.normalize(pred_desc, dim=1)
+
+        return pred_desc
         
     
     def forward(self, img):
@@ -325,7 +260,7 @@ class VarianceKPNetModel(nn.Module):
         
         # 2. descriptor map (full map)
         desc_map = self.descriptor_encoder(shared_featmap)  # [B,feat_dim,H,W]
-        desc_map = F.normalize(desc_map, dim=1)
+        #desc_map = F.normalize(desc_map, dim=1)
 
         # 2. variance map (full map)
         variance_map = self.variance_head(desc_map)  # [B,1,H,W]

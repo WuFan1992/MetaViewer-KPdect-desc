@@ -256,6 +256,37 @@ class Trainer(object):
             self.writer.add_scalar('Loss/variance', loss_var, iter)
 
 
+import matplotlib.pyplot as plt
+import torchvision.transforms.functional as TF
+
+
+def visualize_group_points(imgs, coords, title=""):
+    """
+    imgs: list of [3,H,W] tensor, 每张图
+    coords: list of [2] tensor, 每张图对应的一个点 [y,x]
+    """
+    V = len(imgs)
+    fig, axes = plt.subplots(1, V, figsize=(4*V, 4))
+    
+    if V == 1:
+        axes = [axes]
+    
+    for i in range(V):
+        img = imgs[i].cpu().permute(1,2,0).numpy()  # CHW -> HWC
+        # 反归一化（ImageNet）
+        img = img * np.array([0.229,0.224,0.225]) + np.array([0.485,0.456,0.406])
+        img = np.clip(img, 0, 1)
+        axes[i].imshow(img)
+        
+        yx = coords[i].cpu().numpy()
+        x, y = yx[0], yx[1]
+        axes[i].scatter(x, y, s=80, c='r', marker='x')
+        axes[i].set_title(f"Image {i}")
+        axes[i].axis('off')
+    
+    plt.suptitle(title)
+    plt.show()
+
 def sfm_collate_fn(batch):
     return batch  # batch 是 list，每个元素就是 dict
 
@@ -285,12 +316,28 @@ class TrainerMultiView:
         """
         desc_list: list of [N,C], length=V
         """
+
+        V = len(desc_list)
+        C = desc_list[0].shape[1]
+
         desc_stack = torch.stack(desc_list, dim=0)  # [V,N,C]
-        mean_desc = desc_stack.mean(0)
-        var_gt = ((desc_stack - mean_desc)**2).sum(-1).mean(0)
+
+        dist_sum = 0
+        count = 0
+
+        for i in range(V):
+            for j in range(i+1, V):
+
+                dist = ((desc_stack[i] - desc_stack[j])**2).sum(-1) / C
+
+                dist_sum += dist
+                count += 1
+
+        var_gt = dist_sum / count
+
         return var_gt.detach()
 
-    def train_iters(self, V=5, patch=3):
+    def train_iters(self, V=6, patch=3):
         self.kpnet.train()
         data_iter = iter(self.data_loader)
 
@@ -311,19 +358,47 @@ class TrainerMultiView:
 
             # 读取图像并计算 descriptor
             imgs = []
-            poses = [] 
+            poses = []
+            raw_imgs = [] 
             for v in range(V):
                 img_batch = []
                 pose_batch = []
+                raw_img_batch=[]
                 for img_id in all_image_ids[v]:
                     img = self.dataset.get_img(img_id.item()).to(self.device)
                     pose = self.dataset.get_pose(img_id).to(self.device)
-                    pose = pose_matrix_to_7d(pose)
+                    raw_img =self.dataset.get_raw_img(img_id.item()).to(self.device) 
                     img_batch.append(img)
                     pose_batch.append(pose)
+                    raw_img_batch.append(raw_img)
                 imgs.append(torch.stack(img_batch, dim=0))  # [num_sample, C,H,W]
                 poses.append(torch.stack(pose_batch, dim=0))  # [num_sample, pose_dim]
-                
+                raw_imgs.append(torch.stack(raw_img_batch, dim=0))
+            ################################################## 
+            """
+            from matplotlib.patches import Circle   
+
+
+            # 创建一个 figure，每张图片一个子图
+            fig, axes = plt.subplots(1, V, figsize=(5*V, 5))
+
+            if V == 1:
+                axes = [axes]  # 保证是 list
+
+            for i in range(V):
+                img = raw_imgs[0][i].permute(1,2,0).cpu().numpy()  # H x W x C
+                axes[i].imshow(img)
+                axes[i].axis('off')
+    
+                # 在对应 coords 上画圆圈
+                x, y = all_coords[0][i].cpu().numpy()
+                circ = Circle((x, y), radius=10, edgecolor='red', facecolor='none', linewidth=2)
+                axes[i].add_patch(circ)
+
+            plt.show()
+            """
+            #############################################################       
+            H_orig, W_orig = imgs[0].shape[2:]     
             # 假设 kpnet.forward(imgs) 返回 shared_feats, desc_maps, variance_maps, reliability_maps
             shared_feats, desc_maps, variance_maps, reliability_maps = [], [], [], []
             for v in range(V):
@@ -338,39 +413,100 @@ class TrainerMultiView:
             desc_list, var_list, rel_list = [], [], []
             for v in range(V):
                 # sample_map_at_coords(desc_map, coords) 返回 [num_sample, C]
-                desc_list.append(sample_map_at_coords(desc_maps[v], all_coords[v]))
-                var_list.append(sample_map_at_coords(variance_maps[v], all_coords[v]))
-                rel_list.append(sample_map_at_coords(reliability_maps[v], all_coords[v]))
+                desc_list.append(sample_map_at_coords(desc_maps[v], all_coords[v], H_orig, W_orig))
+                var_list.append(sample_map_at_coords(variance_maps[v], all_coords[v], H_orig, W_orig))
+                rel_list.append(sample_map_at_coords(reliability_maps[v], all_coords[v], H_orig, W_orig))
 
-            # Multi-view variance supervision
-            var_gt = self.compute_multi_view_variance(desc_list)
-            var_pred = torch.stack(var_list).mean(0)
-            loss_var = (var_gt / (var_pred + 1e-6) + torch.log(var_pred + 1e-6)).mean()
-
+           
+            
+            ########
+            ######### 这里出错了，是一个v 内部比，而不是v 之间比 这里的v 可以看成是batch ，因为一个v 内部的5个图像才是符合同一个3D点的。
+            ######
+        
             # Multi-view soft patch matching
             loss_ds, conf_all = 0, []
+            num_sample = desc_list[0].shape[0]
+            desc_tensor = torch.stack(desc_list, dim=0)
+            var_tensor = torch.stack(var_list, dim=0)
+            rel_tensor = torch.stack(rel_list, dim=0)
+            coords_tensor = torch.stack(all_coords, dim=0)
+            desc_map_tensor = torch.stack(desc_maps, dim=0)
+            poses_tensor = torch.stack(poses, dim=0)
+            
+            
+            for i in range(num_sample):
+                for j in range(num_sample):
+                    if i!=j:
+                        l, conf = soft_patch_matching(desc_tensor[:,i], desc_map_tensor[:,j], coords_tensor[:,j], H_orig, W_orig,patch=patch)
+                        loss_ds += l
+                        conf_all.append(conf)
+            
+            """
             for i in range(V):
                 for j in range(V):
                     if i != j:
-                        l, conf = soft_patch_matching(desc_list[i], desc_maps[j], all_coords[j], patch=patch)
+                        l, conf = soft_patch_matching(desc_list[i], desc_maps[j], all_coords[j], H_orig, W_orig,patch=patch)
                         loss_ds += l
                         conf_all.append(conf)
+            """         
             loss_ds /= V*(V-1)
             conf_target = torch.stack(conf_all).mean(0)
 
             # Reliability supervision
-            loss_kp = sum([reliability_loss(rel_list[v], conf_target) for v in range(V)]) / V
+            loss_kp = sum([reliability_loss(rel_tensor[:,n], conf_target) for n in range(num_sample)]) / num_sample
+            
+             # ===== viewpoint-guided variance supervision =====
+            # 1. variance loss (只在 warm-up 后开启)
+            if iter_idx >0: # warmup
+                loss_var = viewpoint_guided_variance_loss(var_tensor, poses_tensor)
+            else:
+                loss_var = torch.tensor(0.0, device=self.device)
+
+            
 
             # Reconstruction loss
+            # ===== cross-view reconstruction =====
             loss_rec = 0
-            for v in range(V):
-                backbone_pred = self.kpnet.reconstruction(
-                    poses[v], all_coords[v], desc_list[v].unsqueeze(0), shared_feats[v]
-                )
-                sampled_backbone = sample_map_at_coords(shared_feats[v], all_coords[v])
-                loss_rec += cross_view_recon_loss(backbone_pred, sampled_backbone)
-            loss_rec /= V
-
+            """
+            for u in range(V):
+                for v in range(V):
+                    if u == v:
+                        continue
+                    # source descriptor
+                    desc_src = desc_list[u]      # [N,C]
+                    # target descriptor (GT)
+                    desc_tgt = desc_list[v]      # [N,C]
+                    # cross-view reconstruction
+                    pred_desc = self.kpnet.reconstruction(
+                            desc_src=desc_src,
+                            pose_src=poses[u],   # [N,4,4]
+                            pose_tgt=poses[v]    # [N,4,4]
+                    )           
+                    # cosine reconstruction loss
+                    var_weight = torch.exp(-var_list[v].squeeze())
+                    loss_rec += (var_weight *(1 - F.cosine_similarity(pred_desc, desc_tgt, dim=1))).mean()
+            """
+            for u in range(num_sample):
+                for v in range(num_sample):
+                    if u == v:
+                        continue
+                    # source descriptor
+                    desc_src = desc_tensor[:,u]      # [N,C]
+                    # target descriptor (GT)
+                    desc_tgt = desc_tensor[:,v]      # [N,C]
+                    # cross-view reconstruction
+                    pred_desc = self.kpnet.reconstruction(
+                            desc_src=desc_src,
+                            pose_src=poses_tensor[:,u],   # [N,4,4]
+                            pose_tgt=poses_tensor[:,v]    # [N,4,4]
+                    )           
+                    # cosine reconstruction loss
+                    var_weight = torch.exp(-var_tensor[:,v].squeeze())
+                    loss_rec += (var_weight *(1 - F.cosine_similarity(pred_desc, desc_tgt, dim=1))).mean()
+            
+            
+            loss_rec /= (num_sample * (num_sample - 1))
+            
             # 总 loss
             w_var, w_ds, w_kp, w_rec = 0.01, 0.05, 5, 0.2
             loss = w_var*loss_var + w_ds*loss_ds + w_kp*loss_kp + w_rec*loss_rec
@@ -406,7 +542,7 @@ if __name__ == "__main__":
     data_path = "datasets/head"
     cpkt_save_path = "checkpoints/"
     num_iters = 2000
-    variance_kpnet = VarianceKPNetModel(in_channels=64, pose_dim=7, feature_dim=64, pose_embed=64)
+    variance_kpnet = VarianceKPNetModel(in_channels=64, pose_dim=9, feature_dim=64, pose_embed=64)
     trainer = TrainerMultiView(variance_kpnet, data_path, cpkt_save_path, num_iters)
     trainer.train_iters()
 
