@@ -11,7 +11,7 @@ from modules.sfm_loader import *
 from modules.utils import *
 
 from methods.EmbPose.varkpnetmodel import VarianceKPNetModel
-from methods.EmbPose.warper import spvs_coarse_orig_res,sample_fixed_points
+
 from methods.EmbPose.loss import *
 
 def plot_matched_keypoints(image1, keypoints1, image2, keypoints2,
@@ -86,176 +86,6 @@ def sfm_collate_fn(batch):
     return batch_data0, batch_data1, matches_list
 
 
-
-class Trainer(object):
-    def __init__(self, kpnet, data_path, cpkt_save_path, num_iters):
-        
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.kpnet = kpnet.to(self.device)
-        #self.xfeat = XFeat(top_k=4096).to(self.device)
-        
-        points,images, cameras, test_images = loadSFM(data_path)
-        camera_infos = readColmapCameras(images,cameras, test_images)
-
-        self.dataset = SfMDataset(points, images, camera_infos, data_path)
-        self.data_loader = data.DataLoader(self.dataset, batch_size=8, shuffle=True,collate_fn=sfm_collate_fn)
-        self.data_loader_iter = iter(self.data_loader)  # 把数据变成迭代器，方便使用next 一个一个获取
-        
-        self.optimizer = optim.Adam(filter(lambda x: x.requires_grad, self.kpnet.parameters()) , lr = 3e-4)
-        self.scheduler = torch.optim.lr_scheduler.StepLR(self.optimizer, step_size=30_000, gamma=0.5)
-        
-        self.num_iters = num_iters
-        self.progress_bar = tqdm(range(0, self.num_iters), desc="Training progress")
-        self.writer = SummaryWriter(cpkt_save_path + f'/logdir/scr_kpdect_' + time.strftime("%Y_%m_%d-%H_%M_%S"))
-        self.save_ckpt_every = 1000
-        self.cpkt_save_path = cpkt_save_path
-        
-    def train_iters(self):
-        
-        # -------------------------------
-        # 初始 loss 权重
-        # -------------------------------
-        w_rec_init = 0.05
-        w_ds_init  = 0.05
-        w_kp_init  = 0.05   # 早期 reliability 低，防止梯度塌
-        w_var_init = 1    # early stage 保持 small weight
-
-        w_rec = 0.1
-        w_desc = 0.05
-        w_kp = 1
-        w_var = 10
-        
-        for iter in range(self.num_iters):
-            try:
-                data0, data1, matches_list = next(self.data_loader_iter)
-            except StopIteration:
-                self.data_loader_iter = iter(self.data_loader)
-                data0, data1, matches_list = next(self.data_loader_iter)
-            
-            img0, img1 = data0["img"].to(self.device), data1["img"].to(self.device)               
-            pose0_7d = pose_matrix_to_7d(data0["pose"]).to(self.device)
-            pose1_7d = pose_matrix_to_7d(data1["pose"]).to(self.device) 
-                        
-
-            
-            # -------------------------------
-            # 动态 loss 权重 warmup
-            # -------------------------------
-            progress = np.clip(iter / 2000, 0.0, 1.0)  # 前2000 iteration warmup
-            w_rec  = w_rec_init  + (w_rec_max - w_rec_init) * progress
-            w_ds   = w_ds_init   + (w_ds_max  - w_ds_init)  * progress
-            w_kp   = w_kp_init   + (w_kp_max  - w_kp_init)  * progress
-
-            
-            
-            if progress < 0.2:
-                w_var = 0.5
-            elif progress < 0.6:
-                w_var = 0.5+ 15 * (progress - 0.2)/0.3
-            else:
-                w_var = 50 + (100 - 50) * (progress - 0.5)/0.5
-
-            loss_items = []
-            
-            for b in range(len(matches_list)):
-                pts = matches_list[b].to(self.device)  # [S_i,4]
-                if pts.shape[0] == 0:
-                    continue
-
-                coords0 = pts[:, :2].unsqueeze(0).to(self.device)  # [1, S_i, 2]
-                coords1 = pts[:, 2:].unsqueeze(0).to(self.device)
-                
-                
-
-                pose0 = data0["pose"][b].to(self.device)
-                pose1 = data1["pose"][b].to(self.device)
-                
-                shared_featmap0, variance_map0, desc_map0, reliability_map0 = self.kpnet(img0[b].unsqueeze(0))
-                shared_featmap1, variance_map1, desc_map1, reliability_map1 = self.kpnet(img1[b].unsqueeze(0))
-
-                # Visualize the gt matching
-                #img0_norm = (img0[b]/255).cpu().numpy().transpose(1,2,0) 
-                #img1_norm = (img1[b]/255).cpu().numpy().transpose(1,2,0) 
-                #plot_matched_keypoints(img0_norm,pts[:, :2], img1_norm, pts[:, 2:] )
-
-
-                sampled_desc0 = sample_map_at_coords(desc_map0, coords0)
-                sampled_desc1 = sample_map_at_coords(desc_map1, coords1)
-                
-                # 防止网络直接用 backbone 绕过 descriptor learning
-                shared_featmap0_detach = shared_featmap0.detach() if progress < 0.3 else shared_featmap0
-                shared_featmap1_detach = shared_featmap1.detach() if progress < 0.3 else shared_featmap1
-
-                
-                backbone_pred0 = self.kpnet.reconstruction(pose0_7d[b].unsqueeze(0), coords0, sampled_desc0, shared_featmap0_detach)
-                backbone_pred1 = self.kpnet.reconstruction(pose1_7d[b].unsqueeze(0), coords1, sampled_desc1, shared_featmap1_detach)
-                
-                # Sample the map to get the point-wise value 
-                sampled_backbone0 = sample_map_at_coords(shared_featmap0, coords0)
-                sampled_backbone1 = sample_map_at_coords(shared_featmap1, coords1)
-                sampled_rel0 = sample_map_at_coords(reliability_map0, coords0)
-                sampled_rel1 = sample_map_at_coords(reliability_map1, coords1)
-                sampled_var0 = sample_map_at_coords(variance_map0, coords0)
-                sampled_var1 = sample_map_at_coords(variance_map1, coords1)
-                
-                
-                loss_rec = cross_view_recon_loss(backbone_pred0, sampled_backbone1) + cross_view_recon_loss(backbone_pred1, sampled_backbone0)
-                
-                #################
-                sim = sampled_desc0 @ sampled_desc1.transpose(1, 2)
-                sim = sim.squeeze(0)
-                #print("diag", sim.diag().mean(),"mean",  sim.mean())
-                ##################
-                
-                loss_ds, conf = dual_softmax_loss(sampled_desc0.squeeze(0),sampled_desc1.squeeze(0),temp=1.0, hard_negative_k=5)
-                #print("loss_ds = ", loss_ds)
-                
-                
-                # detach + normalize conf 避免 early stage reliability loss 梯度太小
-                conf_detach = conf.detach()
-                conf_detach = conf_detach / (conf_detach.max() + 1e-8)
-                loss_kp = reliability_loss(sampled_rel0, conf_detach) + reliability_loss(sampled_rel1, conf_detach)
-                
-                loss_var = variance_loss_pose_aware_single(sampled_desc0.squeeze(0), sampled_desc1.squeeze(0), sampled_var0, sampled_var1, pose0, pose1, sampled_rel0, sampled_rel1, detach_desc_diff=True,min_weight=0.1)
-                
-                loss_rec_w = w_rec * loss_rec
-                loss_ds_w  = w_ds  * loss_ds
-                loss_kp_w  = w_kp  * loss_kp
-                loss_var_w = w_var * loss_var
-        
-                
-                loss_batch = loss_rec_w + loss_ds_w + loss_kp_w + loss_var_w
-                loss_items.append(loss_batch)
-                if b == 0:
-                    acc_coarse_0 = check_accuracy(sampled_desc0.squeeze(0), sampled_desc1.squeeze(0))
-                acc_coarse = check_accuracy(sampled_desc0.squeeze(0), sampled_desc1.squeeze(0))
-                
-            
-            loss = torch.stack(loss_items).mean()
-            
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.kpnet.parameters(), 1.)
-            self.optimizer.step()
-            self.optimizer.zero_grad()
-            self.scheduler.step()
-            
-            if (iter+1) % self.save_ckpt_every == 0:
-                print('saving iter ', iter+1)
-                torch.save(self.kpnet.state_dict(), self.cpkt_save_path + f'variancekpnet_{iter+1}.pth')
-                
-            self.progress_bar.set_description( 'Loss: {:.4f} acc_c0 {:.3f} acc_c1 {:.3f} loss_desc: {:.3f} loss_recon: {:.3f} loss_kp: {:.3f}  loss_var: {:.3f}'.format(
-                                                                        loss.item(), acc_coarse_0, acc_coarse, loss_ds_w.item(), loss_rec_w.item(), loss_kp_w.item(), loss_var_w.item()) )
-            self.progress_bar.update(1)
-            
-            # Log metrics
-            self.writer.add_scalar('Loss/total', loss.item(), iter)
-            self.writer.add_scalar('Accuracy/coarse_matching accuracy', acc_coarse, iter)
-            self.writer.add_scalar('Loss/description', loss_ds_w, iter)
-            self.writer.add_scalar('Loss/recontruction', loss_rec_w, iter)
-            self.writer.add_scalar('Loss/reliability', loss_kp_w, iter)
-            self.writer.add_scalar('Loss/variance', loss_var, iter)
-
-
 import matplotlib.pyplot as plt
 import torchvision.transforms.functional as TF
 
@@ -311,6 +141,7 @@ class TrainerMultiView:
         self.top_k = top_k
         
         self.progress_bar = tqdm(range(0, self.num_iters), desc="Training progress")
+        self.writer = SummaryWriter(cpkt_save_path + f'/logdir/scr_kpdect_' + time.strftime("%Y_%m_%d-%H_%M_%S"))
 
     def compute_multi_view_variance(self, desc_list):
         """
@@ -337,18 +168,17 @@ class TrainerMultiView:
 
         return var_gt.detach()
 
-    def train_iters(self, V=6, patch=3):
+    def train_iters(self, B=6, patch=3):
         self.kpnet.train()
         data_iter = iter(self.data_loader)
 
         for iter_idx in range(self.num_iters):
             try:
-                batch_data = [next(data_iter) for _ in range(V)]
+                batch_data = [next(data_iter) for _ in range(B)]
             except StopIteration:
                 data_iter = iter(self.data_loader)
-                batch_data = [next(data_iter) for _ in range(V)]
+                batch_data = [next(data_iter) for _ in range(B)]
             
-
             # batch_data[v] 是 list, batch_size=1
             batch_data = [b[0] for b in batch_data]  # 去掉最外层 list
 
@@ -360,11 +190,11 @@ class TrainerMultiView:
             imgs = []
             poses = []
             raw_imgs = [] 
-            for v in range(V):
+            for b in range(B):
                 img_batch = []
                 pose_batch = []
                 raw_img_batch=[]
-                for img_id in all_image_ids[v]:
+                for img_id in all_image_ids[b]:
                     img = self.dataset.get_img(img_id.item()).to(self.device)
                     pose = self.dataset.get_pose(img_id).to(self.device)
                     raw_img =self.dataset.get_raw_img(img_id.item()).to(self.device) 
@@ -385,8 +215,9 @@ class TrainerMultiView:
             if V == 1:
                 axes = [axes]  # 保证是 list
 
-            for i in range(V):
+            for i in range(5):
                 img = raw_imgs[0][i].permute(1,2,0).cpu().numpy()  # H x W x C
+                print("img shape = ", img.shape)
                 axes[i].imshow(img)
                 axes[i].axis('off')
     
@@ -401,24 +232,24 @@ class TrainerMultiView:
             H_orig, W_orig = imgs[0].shape[2:]     
             # 假设 kpnet.forward(imgs) 返回 shared_feats, desc_maps, variance_maps, reliability_maps
             shared_feats, desc_maps, variance_maps, reliability_maps = [], [], [], []
-            for v in range(V):
-                sf, var, desc, rel = self.kpnet(imgs[v])  # imgs[v]: [num_sample,C,H,W]
+            for b in range(B):
+                sf, var, desc, rel = self.kpnet(imgs[b])  # imgs[v]: [num_sample,C,H,W]
                 shared_feats.append(sf)
                 desc_maps.append(desc)
                 variance_maps.append(var)
                 reliability_maps.append(rel)
 
+
             # 对每个 3D 点采样 descriptor & variance
             # 这里假设每个 3D 点在不同图像上对应 coords
             desc_list, var_list, rel_list = [], [], []
-            for v in range(V):
+            for b in range(B):
                 # sample_map_at_coords(desc_map, coords) 返回 [num_sample, C]
-                desc_list.append(sample_map_at_coords(desc_maps[v], all_coords[v], H_orig, W_orig))
-                var_list.append(sample_map_at_coords(variance_maps[v], all_coords[v], H_orig, W_orig))
-                rel_list.append(sample_map_at_coords(reliability_maps[v], all_coords[v], H_orig, W_orig))
+                desc_list.append(sample_map_at_coords(desc_maps[b], all_coords[b], H_orig, W_orig))
+                var_list.append(sample_map_at_coords(variance_maps[b], all_coords[b], H_orig, W_orig))
+                rel_list.append(sample_map_at_coords(reliability_maps[b], all_coords[b], H_orig, W_orig))
 
-           
-            
+
             ########
             ######### 这里出错了，是一个v 内部比，而不是v 之间比 这里的v 可以看成是batch ，因为一个v 内部的5个图像才是符合同一个3D点的。
             ######
@@ -433,27 +264,15 @@ class TrainerMultiView:
             desc_map_tensor = torch.stack(desc_maps, dim=0)
             poses_tensor = torch.stack(poses, dim=0)
             
+
             
-            for i in range(num_sample):
-                for j in range(num_sample):
-                    if i!=j:
-                        l, conf = soft_patch_matching(desc_tensor[:,i], desc_map_tensor[:,j], coords_tensor[:,j], H_orig, W_orig,patch=patch)
-                        loss_ds += l
-                        conf_all.append(conf)
-            
-            """
-            for i in range(V):
-                for j in range(V):
-                    if i != j:
-                        l, conf = soft_patch_matching(desc_list[i], desc_maps[j], all_coords[j], H_orig, W_orig,patch=patch)
-                        loss_ds += l
-                        conf_all.append(conf)
-            """         
-            loss_ds /= V*(V-1)
+            loss_ds, conf_all = viewpoint_guide_ds_loss(desc_tensor, desc_map_tensor, coords_tensor, H_orig, W_orig, patch)
             conf_target = torch.stack(conf_all).mean(0)
 
             # Reliability supervision
             loss_kp = sum([reliability_loss(rel_tensor[:,n], conf_target) for n in range(num_sample)]) / num_sample
+            
+
             
              # ===== viewpoint-guided variance supervision =====
             # 1. variance loss (只在 warm-up 后开启)
@@ -462,53 +281,37 @@ class TrainerMultiView:
             else:
                 loss_var = torch.tensor(0.0, device=self.device)
 
-            
 
             # Reconstruction loss
             # ===== cross-view reconstruction =====
-            loss_rec = 0
-            """
-            for u in range(V):
-                for v in range(V):
+            loss_rec = 0.0
+            _, V, _ = desc_tensor.shape
+
+            for v in range(V):
+                for u in range(V):
                     if u == v:
                         continue
-                    # source descriptor
-                    desc_src = desc_list[u]      # [N,C]
-                    # target descriptor (GT)
-                    desc_tgt = desc_list[v]      # [N,C]
+
+                    # source descriptor: batch 内所有样本，第 u 个 view
+                    desc_src = desc_tensor[:, u]  # [B, C]
+                    desc_tgt = desc_tensor[:, v]  # [B, C]
+
                     # cross-view reconstruction
                     pred_desc = self.kpnet.reconstruction(
-                            desc_src=desc_src,
-                            pose_src=poses[u],   # [N,4,4]
-                            pose_tgt=poses[v]    # [N,4,4]
-                    )           
-                    # cosine reconstruction loss
-                    var_weight = torch.exp(-var_list[v].squeeze())
-                    loss_rec += (var_weight *(1 - F.cosine_similarity(pred_desc, desc_tgt, dim=1))).mean()
-            """
-            for u in range(num_sample):
-                for v in range(num_sample):
-                    if u == v:
-                        continue
-                    # source descriptor
-                    desc_src = desc_tensor[:,u]      # [N,C]
-                    # target descriptor (GT)
-                    desc_tgt = desc_tensor[:,v]      # [N,C]
-                    # cross-view reconstruction
-                    pred_desc = self.kpnet.reconstruction(
-                            desc_src=desc_src,
-                            pose_src=poses_tensor[:,u],   # [N,4,4]
-                            pose_tgt=poses_tensor[:,v]    # [N,4,4]
-                    )           
-                    # cosine reconstruction loss
-                    var_weight = torch.exp(-var_tensor[:,v].squeeze())
-                    loss_rec += (var_weight *(1 - F.cosine_similarity(pred_desc, desc_tgt, dim=1))).mean()
-            
-            
-            loss_rec /= (num_sample * (num_sample - 1))
+                        desc_src=desc_src,
+                        pose_src=poses_tensor[:, u],  # [B, 4, 4]
+                        pose_tgt=poses_tensor[:, v]   # [B, 4, 4]
+                    )
+
+                    # cosine reconstruction loss with variance weighting
+                    var_weight = torch.exp(-var_tensor[:, v, 0])  # [B]
+                    loss_rec += (var_weight * (1 - F.cosine_similarity(pred_desc, desc_tgt, dim=1))).mean()
+
+            # 平均到 V*(V-1) 个 view pair
+            loss_rec /= V*(V-1)
             
             # 总 loss
-            w_var, w_ds, w_kp, w_rec = 0.01, 0.05, 5, 0.2
+            w_var, w_ds, w_kp, w_rec = 0.2, 0.1, 5, 0.5
             loss = w_var*loss_var + w_ds*loss_ds + w_kp*loss_kp + w_rec*loss_rec
 
             
@@ -522,10 +325,20 @@ class TrainerMultiView:
             self.progress_bar.set_description(f"[Iter {iter_idx}] loss:{loss.item():.4f} var:{loss_var.item():.4f} ds:{loss_ds.item():.4f} kp:{loss_kp.item():.4f} rec:{loss_rec.item():.4f}")
 
             # 10. 定期保存 checkpoint
-            if iter_idx % 2000 == 0 and self.cpkt_save_path is not None:
+            if (iter_idx+1) % 2000 == 0 and self.cpkt_save_path is not None:
                 torch.save(self.kpnet.state_dict(), f"{self.cpkt_save_path}/kpnet_iter_{iter_idx}.pth")
             
             self.progress_bar.update(1)
+            
+            # Log metrics
+            self.writer.add_scalar('Loss/total', loss.item(), iter_idx)
+            self.writer.add_scalar('Loss/description', loss_ds.item(), iter_idx)
+            self.writer.add_scalar('Loss/recontruction', loss_rec.item(), iter_idx)
+            self.writer.add_scalar('Loss/reliability', loss_kp.item(), iter_idx)
+            self.writer.add_scalar('Loss/variance', loss_var.item(), iter_idx)
+
+            
+            
             
 
 

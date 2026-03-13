@@ -8,8 +8,80 @@ from .utils import *
 # -------------------------
 # Shared Backbone
 # -------------------------
+"""
+class SharedBackbone(nn.Module):
+
+    def __init__(self, out_dim=128, freeze=True):
+        super().__init__()
+
+        resnet = models.resnet50(
+            weights=models.ResNet50_Weights.IMAGENET1K_V1
+        )
+
+        # stem
+        self.conv1 = resnet.conv1
+        self.bn1 = resnet.bn1
+        self.relu = resnet.relu
+        self.maxpool = resnet.maxpool
+
+        # feature stages
+        self.layer1 = resnet.layer1   # H/4   C=256
+        self.layer2 = resnet.layer2   # H/8   C=512
+        self.layer3 = resnet.layer3   # H/16  C=1024
+
+        # FPN fusion
+        self.fuse = nn.Sequential(
+            nn.Conv2d(256 + 512 + 1024, 512, 3, padding=1),
+            nn.GroupNorm(16, 512),
+            nn.ReLU(inplace=True),
+
+            nn.Conv2d(512, out_dim, 1),
+            nn.GroupNorm(8, out_dim),
+            nn.ReLU(inplace=True)
+        )
+
+        if freeze:
+            for p in (
+                list(self.conv1.parameters()) +
+                list(self.bn1.parameters()) +
+                list(self.layer1.parameters()) +
+                list(self.layer2.parameters()) +
+                list(self.layer3.parameters())
+            ):
+                p.requires_grad = False
 
 
+    def forward(self, x):
+
+        # stem
+        x = self.conv1(x)   # H/2
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.maxpool(x) # H/4
+
+        # multi-scale features
+        f1 = self.layer1(x)   # [B,256,H/4,W/4]
+        f2 = self.layer2(f1)  # [B,512,H/8,W/8]
+        f3 = self.layer3(f2)  # [B,1024,H/16,W/16]
+
+        # upsample to H/4
+        f2_up = F.interpolate(
+            f2, size=f1.shape[-2:],
+            mode='bilinear', align_corners=False
+        )
+
+        f3_up = F.interpolate(
+            f3, size=f1.shape[-2:],
+            mode='bilinear', align_corners=False
+        )
+
+        # FPN fusion
+        feat = torch.cat([f1, f2_up, f3_up], dim=1)
+
+        feat = self.fuse(feat)
+
+        return feat
+"""
 class SharedBackbone(nn.Module):
 
     def __init__(self, out_dim=128, freeze=True):
@@ -42,7 +114,6 @@ class SharedBackbone(nn.Module):
 
         return feat
 
-
 # -------------------------
 # Descriptor Encoder
 # -------------------------
@@ -66,7 +137,7 @@ class DescriptorEncoder(nn.Module):
 
     def forward(self, x):
         desc = self.net(x)
-        desc = F.normalize(desc, dim=1)
+        #desc = F.normalize(desc, dim=1)
         return desc
 
 
@@ -75,19 +146,33 @@ class DescriptorEncoder(nn.Module):
 # -------------------------
 
 class VarianceHead(nn.Module):
-    def __init__(self, feat_dim=128, epsilon=0.05):
+    def __init__(self, feat_dim=128, epsilon=0.01):
         super().__init__()
         self.epsilon = epsilon
-        self.net = nn.Sequential(
 
-            nn.Conv2d(feat_dim, 64, 3, padding=1),
+        self.net = nn.Sequential(
+            # 第1层卷积 + GroupNorm + ReLU
+            nn.Conv2d(feat_dim, 256, 3, padding=1),
+            nn.GroupNorm(16, 256),
             nn.ReLU(inplace=True),
 
-            nn.Conv2d(64, 1, 1)
+            # 第2层卷积 + GroupNorm + ReLU
+            nn.Conv2d(256, 128, 3, padding=1),
+            nn.GroupNorm(16, 128),
+            nn.ReLU(inplace=True),
+
+            # 第3层卷积 → 输出1通道
+            nn.Conv2d(128, 1, 1)
         )
 
     def forward(self, x):
-        var_pred = F.softplus(self.net(x)) + self.epsilon
+        """
+        x: [B, feat_dim, H, W]  (可以使用 normalize 前的 descriptor)
+        输出:
+            var_pred: [B, 1, H, W], >= epsilon
+        """
+        var_pred = self.net(x)
+        var_pred = F.softplus(var_pred) + self.epsilon  # 保证输出正数
         return var_pred
 
 
@@ -260,10 +345,11 @@ class VarianceKPNetModel(nn.Module):
         
         # 2. descriptor map (full map)
         desc_map = self.descriptor_encoder(shared_featmap)  # [B,feat_dim,H,W]
-        #desc_map = F.normalize(desc_map, dim=1)
-
+        
         # 2. variance map (full map)
         variance_map = self.variance_head(desc_map)  # [B,1,H,W]
+        #desc_map = F.normalize(desc_map, dim=1)
+
         
         # 5. reliability map from descriptor
         reliability_map = self.reliability_head(desc_map)  # [B,1,H,W]
