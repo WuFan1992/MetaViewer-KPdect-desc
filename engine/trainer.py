@@ -18,83 +18,122 @@ from methods.EmbPose.varkpnetmodel import VarianceKPNetModel
 
 from methods.EmbPose.loss import *
 
-def to_numpy_image(img):
-    # Tensor → numpy
-    if isinstance(img, torch.Tensor):
-        img = img.cpu().numpy()
+import numpy as np
 
-    # (C,H,W) → (H,W,C)
-    if img.ndim == 3 and img.shape[0] in [1, 3]:
-        img = np.transpose(img, (1, 2, 0))
+
+def to_numpy_image(img):
+    """
+    统一把输入转成 (H, W, 3)
+    支持:
+    [B,C,H,W], [C,H,W], [H,W]
+    """
+
+    if isinstance(img, torch.Tensor):
+        img = img.detach().cpu().numpy()
+
+    # ===== 1. 去 batch =====
+    if img.ndim == 4:  # [B,C,H,W]
+        img = img[0]
+
+    # ===== 2. CHW -> HWC =====
+    if img.ndim == 3:
+        if img.shape[0] == 1:
+            img = img[0]  # -> (H,W)
+        elif img.shape[0] == 3:
+            img = np.transpose(img, (1, 2, 0))  # -> (H,W,3)
+
+    # ===== 3. 灰度 -> RGB =====
+    if img.ndim == 2:
+        img = np.stack([img]*3, axis=-1)
 
     return img
 
-def plot_matched_keypoints(image1, keypoints1, image2, keypoints2,
-                           point_color='r', line_color='b', point_size=40, show_axis=False):
-    """
-    在两幅图片上绘制匹配关键点，并用线连接匹配点。
 
-    参数：
-    - image1, image2: numpy array 或 tensor, 形状 HxW 或 HxWxC
-    - keypoints1, keypoints2: torch.Tensor 或 numpy array, 形状 N x 2
-    - point_color: str, keypoints 的颜色 (默认红色 'r')
-    - line_color: str, 匹配线的颜色 (默认蓝色 'b')
-    - point_size: int, keypoints 的大小
-    - show_axis: bool, 是否显示坐标轴
+def plot_multi_view_matches(images, multi_corrs, max_points=50, save_path=None):
+    """
+    images: list of 5 images
+    multi_corrs: [N, 5, 2]
     """
 
-    
-    # 转成 numpy
-    if isinstance(keypoints1, torch.Tensor):
-        keypoints1 = keypoints1.cpu().numpy()
-    if isinstance(keypoints2, torch.Tensor):
-        keypoints2 = keypoints2.cpu().numpy()
-    
-    if isinstance(image1, torch.Tensor):
-        image1 = image1.cpu().numpy()
-    if isinstance(image2, torch.Tensor):
-        image2 = image2.cpu().numpy()
+    # ===== 1. 转 numpy + 标准格式 =====
+    imgs = []
+    for img in images:
+        img = to_numpy_image(img)
+        imgs.append(img)
 
-    # 如果是灰度图，保证是 HxW
-    if len(image1.shape) == 2:
-        image1 = np.stack([image1]*3, axis=-1)
-    if len(image2.shape) == 2:
-        image2 = np.stack([image2]*3, axis=-1)
-    
-    image1 = to_numpy_image(image1)
-    image2 = to_numpy_image(image2)
-    
-    # ========= ⭐ 3. 随机采样匹配 =========
-    num_matches = keypoints1.shape[0]
+    # ===== debug（非常建议保留）=====
+    for i, img in enumerate(imgs):
+        print(f"[DEBUG] img[{i}] shape:", img.shape)
 
-    if num_matches > 50:
-        idx = np.random.choice(num_matches, 50, replace=False)
-        keypoints1 = keypoints1[idx]
-        keypoints2 = keypoints2[idx]
+    # ===== 2. 处理匹配点 =====
+    if isinstance(multi_corrs, torch.Tensor):
+        multi_corrs = multi_corrs.detach().cpu().numpy()
 
-    # 并排显示两幅图
-    h1, w1 = image1.shape[:2]
-    h2, w2 = image2.shape[:2]
-    new_h = max(h1, h2)
-    new_w = w1 + w2
-    new_image = np.zeros((new_h, new_w, 3), dtype=image1.dtype)
-    new_image[:h1, :w1, :] = image1
-    new_image[:h2, w1:w1+w2, :] = image2
+    if multi_corrs is None or len(multi_corrs) == 0:
+        print("No correspondences")
+        return
 
-    plt.figure(figsize=(12, 6))
-    plt.imshow(new_image)
+    N = multi_corrs.shape[0]
 
-    # 绘制 keypoints
-    plt.scatter(keypoints1[:, 0], keypoints1[:, 1], c=point_color, s=point_size)
-    plt.scatter(keypoints2[:, 0] + w1, keypoints2[:, 1], c=point_color, s=point_size)  # x 偏移
+    if N > max_points:
+        idx = np.random.choice(N, max_points, replace=False)
+        multi_corrs = multi_corrs[idx]
 
-    # 绘制匹配线
-    for (x1, y1), (x2, y2) in zip(keypoints1, keypoints2):
-        plt.plot([x1, x2 + w1], [y1, y2], c=line_color, linewidth=1)
+    # ===== 3. 拼接图像 =====
+    heights = [img.shape[0] for img in imgs]
+    widths = [img.shape[1] for img in imgs]
 
-    if not show_axis:
-        plt.axis('off')
-    plt.show()
+    H = max(heights)
+    W = sum(widths)
+
+    canvas = np.zeros((H, W, 3), dtype=imgs[0].dtype)
+
+    offsets = []
+    cur_w = 0
+
+    for img in imgs:
+        h, w = img.shape[:2]
+        canvas[:h, cur_w:cur_w+w] = img
+        offsets.append(cur_w)
+        cur_w += w
+
+    # ===== 4. 绘制 =====
+    plt.figure(figsize=(15, 5))
+    plt.imshow(canvas)
+
+    colors = plt.cm.jet(np.linspace(0, 1, len(multi_corrs)))
+
+    for i, pts in enumerate(multi_corrs):
+
+        color = colors[i]
+
+        # 画点
+        for j in range(5):
+            x, y = pts[j]
+            plt.scatter(x + offsets[j], y, c=[color], s=20)
+
+        # 画轨迹线
+        for j in range(4):
+            x1, y1 = pts[j]
+            x2, y2 = pts[j+1]
+
+            plt.plot(
+                [x1 + offsets[j], x2 + offsets[j+1]],
+                [y1, y2],
+                c=color,
+                linewidth=1
+            )
+
+    plt.axis('off')
+    plt.title("Multi-view Correspondences (Tracks)")
+
+    # ===== 5. 显示 or 保存 =====
+    if save_path is not None:
+        plt.savefig(save_path)
+        plt.close()
+    else:
+        plt.show(block=True)
+
     
 def sfm_collate_fn(batch):
     """
@@ -171,7 +210,7 @@ class TrainerMultiView:
         
         
         self.data_loader = torch.utils.data.DataLoader(
-            self.dataset, batch_size=2, shuffle=True
+            self.dataset, batch_size=1, shuffle=True
         )
         self.optimizer = torch.optim.Adam(
             filter(lambda x: x.requires_grad, self.kpnet.parameters()), lr=3e-4
@@ -195,15 +234,28 @@ class TrainerMultiView:
             except StopIteration:
                 data_iter = iter(self.data_loader)
                 batch_data = next(data_iter)
-            print("batch data = ", batch_data)
+            
                 
-            if batch_data is not None:
-                p1, p2 = batch_data['image0'], batch_data['image1']
-                print("p1 shape = ", p1.shape)
-                positives_md_coarse = spvs_coarse(batch_data, 1)
-                pts1, pts2 = positives_md_coarse[0][:, :2], positives_md_coarse[0][:, 2:]
-                plot_matched_keypoints(p1[0], pts1, p2[0], pts2)
-                
+            # ===== 1. 生成 multi-view 对应点 =====
+            multi_corrs = spvs_coarse_multi_cycle(batch_data, scale=4)
+
+            # ===== 2. 可视化=====
+            # ===== 关键：正确取 batch 第一个样本 =====
+            images = []
+            for img in batch_data['images']:
+                if isinstance(img, torch.Tensor) and img.dim() == 4:
+                    images.append(img[0])   # [B,C,H,W] -> [C,H,W]
+                else:
+                    images.append(img)
+
+            # ===== 调用可视化 =====
+            plot_multi_view_matches(
+                images,
+                multi_corrs,
+                max_points=50,
+                save_path=None  # 或 f"debug_{iter_idx}.png"
+            )
+            
 
             # 读取 image_ids 和 coords
             all_image_ids = [b['image_ids'].to(self.device) for b in batch_data]  # [V, num_sample]

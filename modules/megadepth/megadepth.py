@@ -3,20 +3,37 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset
+from collections import defaultdict
 import glob
 from modules.megadepth.megadepth_utils import read_megadepth_gray, read_megadepth_depth, fix_path_from_d2net
 import numpy.random as rnd
 
 import pdb, tqdm, os
 
-# 生成有几何约束的图像对
-# 能计算真实GT 的匹配点
+"""
+从一系列megadepth 匹配图里得到5个同一个view 下对应点信息的方法如下
+选一个 anchor 图 I0：
+
+在 I0 上采样 grid 点
+    用 warp_kpts：
+        I0 → I1
+        I0 → I2
+        I0 → I3
+        I0 → I4
+    对每个点做：
+        valid = valid_01 & valid_02 & valid_03 & valid_04
+        👉 只保留 在5张图都可见的点
+
+"""
+
+
+
 class MegaDepthDataset(Dataset):
     def __init__(self,
                  root_dir,
                  npz_path,
                  mode='train',
-                 min_overlap_score = 0.5, #0.3,
+                 min_overlap_score = 0.1, #0.3,
                  max_overlap_score = 0.7, #1,
                  load_depth = True,
                  img_resize = (800,608), #or None
@@ -68,6 +85,13 @@ class MegaDepthDataset(Dataset):
         del self.scene_info['pair_infos']
         self.pair_infos = [pair_info for pair_info in self.pair_infos if pair_info[1] > min_overlap_score and pair_info[1] < max_overlap_score]
 
+        # Create graph
+        self.graph = defaultdict(list)
+        for (i, j), overlap, _ in self.pair_infos:
+            self.graph[i].append((j, overlap))
+            self.graph[j].append((i, overlap))
+
+
         # parameters for image resizing, padding and depthmap padding
         if mode == 'train':
             assert img_resize is not None #and img_padding and depth_padding
@@ -76,17 +100,26 @@ class MegaDepthDataset(Dataset):
         self.df = df
         self.img_padding = img_padding
         self.depth_max_size = 2000 if depth_padding else None  # the upperbound of depthmaps size in megadepth.
-
-        # for training LoFTR
-        self.augment_fn = augment_fn if mode == 'train' else None
-        self.coarse_scale = getattr(kwargs, 'coarse_scale', 0.125)
-        #pdb.set_trace()
+        self.min_overlap_score = min_overlap_score
+        
+        
         # 兼容 D2 Net 的路径格式
         for idx in range(len(self.scene_info['image_paths'])):
             self.scene_info['image_paths'][idx] = fix_path_from_d2net(self.scene_info['image_paths'][idx])
 
         for idx in range(len(self.scene_info['depth_paths'])):
             self.scene_info['depth_paths'][idx] = fix_path_from_d2net(self.scene_info['depth_paths'][idx])
+        
+    
+    # Sample 5 views from 
+    def sample_five_views(self, anchor):
+        neighbors = [j for j, o in self.graph[anchor] if o > self.min_overlap_score]
+
+        if len(neighbors) < 4:
+            return None
+
+        selected = np.random.choice(neighbors, 4, replace=False)
+        return [anchor] + list(selected)
 
 
     def __len__(self):
@@ -94,91 +127,56 @@ class MegaDepthDataset(Dataset):
 
     def __getitem__(self, idx):
         (idx0, idx1), overlap_score, central_matches = self.pair_infos[idx % len(self)]
-
-        # read grayscale image and mask. (1, h, w) and (h, w)
-        img_name0 = osp.join(self.root_dir, self.scene_info['image_paths'][idx0])
-        img_name1 = osp.join(self.root_dir, self.scene_info['image_paths'][idx1])
         
-        # TODO: Support augmentation & handle seeds for each worker correctly.
-        image0, mask0, scale0 = read_megadepth_gray(
-            img_name0, self.img_resize, self.df, self.img_padding, None)
-            # np.random.choice([self.augment_fn, None], p=[0.5, 0.5]))
-        image1, mask1, scale1 = read_megadepth_gray(
-            img_name1, self.img_resize, self.df, self.img_padding, None)
-            # np.random.choice([self.augment_fn, None], p=[0.5, 0.5]))
+        anchor = idx0  # 或 idx1 都行
+        # 1.采样5张图
+        ids = self.sample_five_views(anchor)
+        
+        if ids is None:
+            return self.__getitem__(np.random.randint(len(self)))  # 重采样
+        
+        # 2. 读取5张图
+        images = []
+        depths = []
+        Ks = []
+        poses = []
+        scales = []
+        
 
-        if self.load_depth:
-            # read depth. shape: (h, w)
-            if self.mode in ['train', 'val']:
-                depth0 = read_megadepth_depth(
-                    osp.join(self.root_dir, self.scene_info['depth_paths'][idx0]), pad_to=self.depth_max_size)
-                depth1 = read_megadepth_depth(
-                    osp.join(self.root_dir, self.scene_info['depth_paths'][idx1]), pad_to=self.depth_max_size)
-            else:
-                depth0 = depth1 = torch.tensor([])
+        for i in ids:
+            img_path = osp.join(self.root_dir, self.scene_info['image_paths'][i])
+            image, mask, scale = read_megadepth_gray(img_path, self.img_resize, self.df, self.img_padding, None)
 
-            # read intrinsics of original size
-            K_0 = torch.tensor(self.scene_info['intrinsics'][idx0].copy(), dtype=torch.float).reshape(3, 3)
-            K_1 = torch.tensor(self.scene_info['intrinsics'][idx1].copy(), dtype=torch.float).reshape(3, 3)
+            images.append(image)
+            scales.append(scale)
 
-            # read and compute relative poses
-            T0 = self.scene_info['poses'][idx0]
-            T1 = self.scene_info['poses'][idx1]
-            T_0to1 = torch.tensor(np.matmul(T1, np.linalg.inv(T0)), dtype=torch.float)[:4, :4]  # (4, 4)
-            T_1to0 = T_0to1.inverse()
+            if self.load_depth:
+                depth = read_megadepth_depth(
+                    osp.join(self.root_dir, self.scene_info['depth_paths'][i]),
+                    pad_to=self.depth_max_size)
+                depths.append(depth)
 
-            data = {
-                'image0': image0,  # (1, h, w)
-                'depth0': depth0,  # (h, w)
-                'image1': image1,
-                'depth1': depth1,
-                'T_0to1': T_0to1,  # (4, 4)
-                'T_1to0': T_1to0,
-                'K0': K_0,  # (3, 3)
-                'K1': K_1,
-                'scale0': scale0,  # [scale_w, scale_h]
-                'scale1': scale1,
-                'dataset_name': 'MegaDepth',
-                'scene_id': self.scene_id,
-                'pair_id': idx,
-                'pair_names': (self.scene_info['image_paths'][idx0], self.scene_info['image_paths'][idx1]),
-            }
-
-            # for LoFTR training
-            # 将mask 下采样到coarse 分辨率的大小
-            if mask0 is not None:  # img_padding is True
-                if self.coarse_scale:
-                    [ts_mask_0, ts_mask_1] = F.interpolate(torch.stack([mask0, mask1], dim=0)[None].float(),
-                                                        scale_factor=self.coarse_scale,
-                                                        mode='nearest',
-                                                        recompute_scale_factor=False)[0].bool()
-                data.update({'mask0': ts_mask_0, 'mask1': ts_mask_1})
-
-        else:  # 没有
+            K = torch.tensor(self.scene_info['intrinsics'][i], dtype=torch.float).reshape(3, 3)
+            Ks.append(K)
+            poses.append(self.scene_info['poses'][i])
             
-            # read intrinsics of original size
-            K_0 = torch.tensor(self.scene_info['intrinsics'][idx0].copy(), dtype=torch.float).reshape(3, 3)
-            K_1 = torch.tensor(self.scene_info['intrinsics'][idx1].copy(), dtype=torch.float).reshape(3, 3)
+        T0 = poses[0]
+        T_0to = []
 
-            # read and compute relative poses
-            T0 = self.scene_info['poses'][idx0]
-            T1 = self.scene_info['poses'][idx1]
-            T_0to1 = torch.tensor(np.matmul(T1, np.linalg.inv(T0)), dtype=torch.float)[:4, :4]  # (4, 4)
-            T_1to0 = T_0to1.inverse()
-
-            data = {
-                'image0': image0,  # (1, h, w)
-                'image1': image1,
-                'T_0to1': T_0to1,  # (4, 4)
-                'T_1to0': T_1to0,
-                'K0': K_0,  # (3, 3)
-                'K1': K_1,
-                'scale0': scale0,  # [scale_w, scale_h]
-                'scale1': scale1,
-                'dataset_name': 'MegaDepth',
-                'scene_id': self.scene_id,
-                'pair_id': idx,
-                'pair_names': (self.scene_info['image_paths'][idx0], self.scene_info['image_paths'][idx1]),
-            }
-
-        return data
+        for i in range(5):
+            Ti = poses[i]
+            T = torch.tensor(np.matmul(Ti, np.linalg.inv(T0)), dtype=torch.float)[:4, :4]
+            T_0to.append(T)
+        
+        data = {
+            'images': images,     # list of 5 (1,H,W)
+            'depths': depths,     # list of 5 (H,W)
+            'Ks': Ks,             # list of 5 (3,3)
+            'T_0to': T_0to,       # list of 5 (4,4)
+            'scales': scales,
+            'dataset_name': 'MegaDepth',
+            'scene_id': self.scene_id,
+            'view_ids': ids,
+        }
+        return data   
+        
