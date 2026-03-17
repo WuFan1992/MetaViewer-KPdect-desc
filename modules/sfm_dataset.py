@@ -23,7 +23,7 @@ class SfMDataset(Dataset):
         self.data_path = os.path.join(data_path, "images/")
         self.mode = mode
         
-        self.min_frame_dist = 10
+        self.min_frame_dist = 20
           # ---- ImageNet 标准化 transform ----
         self.imagenet_transform = transforms.Compose([
             transforms.ToTensor(),  # HWC [0,255] -> CHW [0,1]

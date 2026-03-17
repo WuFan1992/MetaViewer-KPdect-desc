@@ -110,153 +110,54 @@ def viewpoint_guide_ds_loss(desc_tensor, desc_map_tensor, coords_tensor, H_orig,
 
                 
 
-def cross_view_recon_loss(backbone_pred, target_feat, eps=1e-6):
+def compute_multi_view_variance(desc_stack):
     """
-    backbone_pred: [B, C]
-    target_feat:  [B, C]
-    """
-    # L2 normalize
-    pred_norm = F.normalize(backbone_pred, dim=1)
-    target_norm = F.normalize(target_feat, dim=1)
-    
-    # 余弦相似度
-    cos_sim = (pred_norm * target_norm).sum(dim=1)  # [B]
-    
-    # loss = 1 - mean cosine similarity
-    loss = 1 - cos_sim.mean()
-    return loss
-
-
-
-def variance_loss(desc_list, var_list):
-    """
-    desc_list: list of [N,C]
-    var_list:  list of [N,1]
+    desc_stack: [V, N, C]
     """
 
-    V = len(desc_list)
+    V, N, C = desc_stack.shape
 
-    loss = 0
+    dist_sum = 0
     count = 0
 
     for i in range(V):
-        for j in range(V):
+        for j in range(i+1, V):
 
-            if i == j:
-                continue
+            dist = ((desc_stack[i] - desc_stack[j])**2).sum(-1) / C  # [N]
 
-            desc_i = desc_list[i].detach()
-            desc_j = desc_list[j].detach()
-
-            var = var_list[i].squeeze()
-
-            dist = ((desc_i - desc_j)**2).sum(-1)
-
-            loss += (dist / (var + 1e-6) + torch.log(var + 1e-6)).mean()
-
+            dist_sum += dist
             count += 1
 
-    return loss / count
+    var_gt = dist_sum / count
 
-def variance_smooth_loss(var):
+    return var_gt.detach()
 
-    dx = torch.abs(var[:,:,1:,:] - var[:,:,:-1,:])
-    dy = torch.abs(var[:,:,:,1:] - var[:,:,:,:-1])
+def descriptor_invariance_loss(desc_tensor, var_tensor=None, var_thresh=0.1):
+    B, V, C = desc_tensor.shape
 
-    return dx.mean() + dy.mean()
+    # L2 normalize descriptor + 微小噪声
+    desc_tensor = F.normalize(desc_tensor + 1e-3 * torch.randn_like(desc_tensor), dim=2)
 
-def compute_relative_view_variance(poses_src, poses_tgt, scale_angle=1.0):
-    """
-    poses_src, poses_tgt: [B,4,4] 相机pose矩阵
-    return: var_gt_view: [B], 用作variance supervision的目标
-    """
-    R_src = poses_src[:, :3, :3]   # [B,3,3]
-    R_tgt = poses_tgt[:, :3, :3]   # [B,3,3]
+    loss = 0.0
+    count = 0
 
-    # 相对旋转矩阵
-    R_rel = torch.matmul(R_tgt, R_src.transpose(1,2))  # [B,3,3]
+    for i in range(V):
+        for j in range(i+1, V):
+            cos = F.cosine_similarity(desc_tensor[:, i], desc_tensor[:, j], dim=1)  # [B]
+            pair_loss = 1 - cos  # [B]
 
-    # 计算旋转角度 acos((trace(R)-1)/2)
-    trace = R_rel[:,0,0] + R_rel[:,1,1] + R_rel[:,2,2]  # [B]
-    angle = torch.acos(torch.clamp((trace - 1)/2, -1.0, 1.0))  # [B]
+            # 初始阶段去掉 mask
+            if var_tensor is not None:
+                var = 0.5 * (var_tensor[:, i, 0] + var_tensor[:, j, 0])
+                mask = torch.sigmoid(10 * (var_thresh - var))  # [0,1]
+                pair_loss = pair_loss * mask
 
-    # scale成合适范围
-    var_gt_view = scale_angle * angle
+            loss += pair_loss.sum()  # 用 sum 而不是 mean
+            count += B
 
-    return var_gt_view  # [B]
-
-def viewpoint_guided_variance_loss(var_tensor, poses_tensor):
-    """
-    var_tensor: [B, V, 1]   # variance predictions
-    poses_tensor: [B, V, 4, 4]  # camera poses for each view in batch
-    """
-    B, V, _ = var_tensor.shape
-    loss_var = 0.0
-    num_pairs = 0.0
-
-    for v in range(V):
-        for u in range(V):
-            if u == v:
-                continue
-
-            # 每个 batch 内 u,v pair 的相对旋转角度
-            var_gt_view = compute_relative_view_variance(
-                poses_src=poses_tensor[:, u],  # [B,4,4]
-                poses_tgt=poses_tensor[:, v],  # [B,4,4]
-                scale_angle=1.0
-            )  # [B]
-
-            # 取预测的 variance
-            var_pred = torch.clamp(var_tensor[:, u, 0], min=1e-3)  # 避免log(0)
-            
-            # heteroscedastic loss 对 batch 平均
-            pair_loss = (var_gt_view / var_pred + torch.log(var_pred)).mean()
-            #print("pair_loss = ", pair_loss)
-            loss_var += pair_loss
-            num_pairs+=1
-
-    # 对 V*(V-1) 个 view pair 做平均
-    loss_var = loss_var/num_pairs
-
-    return loss_var
+    loss /= count
+    return loss
     
-def fused_variance_loss(self, desc_list, var_list, poses, V, w_desc=0.1):
-    """
-    计算融合 viewpoint-guided 和 descriptor-guided 的 variance loss
-    
-    desc_list: list of [N, C] 每个 view 的 descriptor
-    var_list: list of [N, 1] 每个 view 的预测 variance
-    poses: list of [B, 4, 4] 每个 view 的相机 pose
-    V: view 数量
-    w_desc: descriptor-based variance 权重
-    """
-    loss_view = 0
-    loss_desc = 0
-    
-    for v in range(V):
-        for u in range(V):
-            if u == v:
-                continue
-            
-            # ----- 1. viewpoint-guided variance -----
-            var_gt_view = compute_relative_view_variance(
-                poses_src=poses[u],
-                poses_tgt=poses[v],
-                scale_angle=1.0
-            )  # [N]
-            var_pred = var_list[u].squeeze()  # [N]
-            loss_view += (var_gt_view / (var_pred + 1e-6) + torch.log(var_pred + 1e-6)).mean()
-            
-            # ----- 2. descriptor-guided variance -----
-            desc_gt_diff = ((desc_list[u] - desc_list[v])**2).sum(-1)  # L2 差 [N]
-            loss_desc += (desc_gt_diff / (var_pred + 1e-6) + torch.log(var_pred + 1e-6)).mean()
-    
-    # 归一化
-    loss_view /= V*(V-1)
-    loss_desc /= V*(V-1)
-    
-    # 总 loss
-    loss_var = loss_view + w_desc * loss_desc
-    return loss_var
+
 
 

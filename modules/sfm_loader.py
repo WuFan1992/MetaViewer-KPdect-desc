@@ -335,7 +335,7 @@ def build_images_pairs(points_dict, images,
 def build_multiview_groups(points_dict, images,
                            train_ids, test_ids,
                            frame_index,
-                           min_frame_dist=10):
+                           min_frame_dist=20):
     """
     构建 multi-view training groups.
     

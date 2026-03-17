@@ -285,7 +285,7 @@ class VarianceKPNetModel(nn.Module):
         super().__init__()
 
         # backbone
-        self.backbone = SharedBackbone(in_channels, feature_dim)
+        self.backbone = SharedBackbone(out_dim=feature_dim)
 
         # descriptor branch
         self.descriptor_encoder = DescriptorEncoder(feature_dim, feature_dim)

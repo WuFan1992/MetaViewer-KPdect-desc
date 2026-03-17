@@ -5,6 +5,7 @@ from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
 import time
 import matplotlib.pyplot as plt
+from matplotlib.patches import Circle
 
 from modules.sfm_dataset import SfMDataset
 from modules.sfm_loader import *
@@ -13,6 +14,8 @@ from modules.utils import *
 from methods.EmbPose.varkpnetmodel import VarianceKPNetModel
 
 from methods.EmbPose.loss import *
+
+
 
 def plot_matched_keypoints(image1, keypoints1, image2, keypoints2,
                            point_color='r', line_color='b', point_size=40, show_axis=False):
@@ -127,6 +130,8 @@ class TrainerMultiView:
         
         points,images, cameras, test_images = loadSFM(datapath)
         camera_infos = readColmapCameras(images,cameras, test_images)
+        
+        self.camera_infos = camera_infos
 
         self.dataset = SfMDataset(points, images, camera_infos, datapath)
         self.data_loader = torch.utils.data.DataLoader(
@@ -143,30 +148,6 @@ class TrainerMultiView:
         self.progress_bar = tqdm(range(0, self.num_iters), desc="Training progress")
         self.writer = SummaryWriter(cpkt_save_path + f'/logdir/scr_kpdect_' + time.strftime("%Y_%m_%d-%H_%M_%S"))
 
-    def compute_multi_view_variance(self, desc_list):
-        """
-        desc_list: list of [N,C], length=V
-        """
-
-        V = len(desc_list)
-        C = desc_list[0].shape[1]
-
-        desc_stack = torch.stack(desc_list, dim=0)  # [V,N,C]
-
-        dist_sum = 0
-        count = 0
-
-        for i in range(V):
-            for j in range(i+1, V):
-
-                dist = ((desc_stack[i] - desc_stack[j])**2).sum(-1) / C
-
-                dist_sum += dist
-                count += 1
-
-        var_gt = dist_sum / count
-
-        return var_gt.detach()
 
     def train_iters(self, B=6, patch=3):
         self.kpnet.train()
@@ -185,7 +166,12 @@ class TrainerMultiView:
             # 读取 image_ids 和 coords
             all_image_ids = [b['image_ids'].to(self.device) for b in batch_data]  # [V, num_sample]
             all_coords = [b['coords'].to(self.device) for b in batch_data]        # [V, num_sample,2]
-
+            """
+            print("all_imag_ids[0] = ", all_image_ids[0])
+            image_ids = all_image_ids[0].cpu().numpy()
+            names = [self.camera_infos["image_name_list"][i] for i in image_ids]
+            print("all_image_ids 0 names =", names)
+            """
             # 读取图像并计算 descriptor
             imgs = []
             poses = []
@@ -210,14 +196,13 @@ class TrainerMultiView:
 
 
             # 创建一个 figure，每张图片一个子图
-            fig, axes = plt.subplots(1, V, figsize=(5*V, 5))
+            fig, axes = plt.subplots(1, B, figsize=(5*B, 5))
 
-            if V == 1:
+            if B == 1:
                 axes = [axes]  # 保证是 list
 
             for i in range(5):
                 img = raw_imgs[0][i].permute(1,2,0).cpu().numpy()  # H x W x C
-                print("img shape = ", img.shape)
                 axes[i].imshow(img)
                 axes[i].axis('off')
     
@@ -242,17 +227,14 @@ class TrainerMultiView:
 
             # 对每个 3D 点采样 descriptor & variance
             # 这里假设每个 3D 点在不同图像上对应 coords
-            desc_list, var_list, rel_list = [], [], []
+            desc_list, var_list, rel_list, sf_list = [], [], [], []
             for b in range(B):
                 # sample_map_at_coords(desc_map, coords) 返回 [num_sample, C]
                 desc_list.append(sample_map_at_coords(desc_maps[b], all_coords[b], H_orig, W_orig))
                 var_list.append(sample_map_at_coords(variance_maps[b], all_coords[b], H_orig, W_orig))
                 rel_list.append(sample_map_at_coords(reliability_maps[b], all_coords[b], H_orig, W_orig))
+                sf_list.append(sample_map_at_coords(shared_feats[b], all_coords[b], H_orig, W_orig))
 
-
-            ########
-            ######### 这里出错了，是一个v 内部比，而不是v 之间比 这里的v 可以看成是batch ，因为一个v 内部的5个图像才是符合同一个3D点的。
-            ######
         
             # Multi-view soft patch matching
             loss_ds, conf_all = 0, []
@@ -263,11 +245,29 @@ class TrainerMultiView:
             coords_tensor = torch.stack(all_coords, dim=0)
             desc_map_tensor = torch.stack(desc_maps, dim=0)
             poses_tensor = torch.stack(poses, dim=0)
+            sf_tensor = torch.stack(sf_list, dim=0)   # [B,V,C]
+            
+            
+            print("A diff:", (1 - F.cosine_similarity(
+                sf_tensor[:,0],
+                sf_tensor[:,1],
+                dim=1)).mean())
+
+            print("B diff:", (1 - F.cosine_similarity(
+                desc_tensor[:,0],
+                desc_tensor[:,1],
+                dim=1)).mean())
+            
+            
+            loss_inv = descriptor_invariance_loss(
+                desc_tensor,
+                var_tensor,
+                var_thresh=0.1
+            )
             
 
-            
             loss_ds, conf_all = viewpoint_guide_ds_loss(desc_tensor, desc_map_tensor, coords_tensor, H_orig, W_orig, patch)
-            conf_target = torch.stack(conf_all).mean(0)
+            conf_target = torch.stack(conf_all).mean(0).detach()
 
             # Reliability supervision
             loss_kp = sum([reliability_loss(rel_tensor[:,n], conf_target) for n in range(num_sample)]) / num_sample
@@ -275,9 +275,12 @@ class TrainerMultiView:
 
             
              # ===== viewpoint-guided variance supervision =====
+            desc_stack = desc_tensor.permute(1,0,2)  # [V,B,C]
+            var_gt = compute_multi_view_variance(desc_stack)  # [B]
+            var_pred = var_tensor.mean(1).squeeze(-1)  # [B]
             # 1. variance loss (只在 warm-up 后开启)
             if iter_idx >0: # warmup
-                loss_var = viewpoint_guided_variance_loss(var_tensor, poses_tensor)
+                loss_var = F.smooth_l1_loss(var_pred, var_gt)
             else:
                 loss_var = torch.tensor(0.0, device=self.device)
 
@@ -286,7 +289,8 @@ class TrainerMultiView:
             # ===== cross-view reconstruction =====
             loss_rec = 0.0
             _, V, _ = desc_tensor.shape
-
+            
+            
             for v in range(V):
                 for u in range(V):
                     if u == v:
@@ -294,7 +298,10 @@ class TrainerMultiView:
 
                     # source descriptor: batch 内所有样本，第 u 个 view
                     desc_src = desc_tensor[:, u]  # [B, C]
-                    desc_tgt = desc_tensor[:, v]  # [B, C]
+                    sf_tgt = sf_tensor[:, v].detach()  # [B, C]
+
+                    # 加入一点点噪声 ，防止学习decoder(x) = x
+                    desc_src = desc_src + 0.02 * torch.randn_like(desc_src)
 
                     # cross-view reconstruction
                     pred_desc = self.kpnet.reconstruction(
@@ -305,15 +312,21 @@ class TrainerMultiView:
 
                     # cosine reconstruction loss with variance weighting
                     var_weight = torch.exp(-var_tensor[:, v, 0])  # [B]
-                    loss_rec += (var_weight * (1 - F.cosine_similarity(pred_desc, desc_tgt, dim=1))).mean()
+                    loss_rec += (var_weight * (1 - F.cosine_similarity(pred_desc, sf_tgt, dim=1))).mean()
 
             # 平均到 V*(V-1) 个 view pair
             loss_rec /= V*(V-1)
             
             # 总 loss
-            w_var, w_ds, w_kp, w_rec = 0.2, 0.1, 5, 0.5
-            loss = w_var*loss_var + w_ds*loss_ds + w_kp*loss_kp + w_rec*loss_rec
+            w_var, w_ds, w_kp, w_rec, w_inv = 0.2, 0.1, 5, 0.5, 1.0
 
+            loss = (
+                w_var * loss_var +
+                w_ds  * loss_ds  +
+                w_kp  * loss_kp  +
+                w_rec * loss_rec +
+                w_inv * loss_inv
+            )
             
             # backward
             loss.backward()
@@ -322,7 +335,7 @@ class TrainerMultiView:
             self.optimizer.zero_grad()
             self.scheduler.step()
 
-            self.progress_bar.set_description(f"[Iter {iter_idx}] loss:{loss.item():.4f} var:{loss_var.item():.4f} ds:{loss_ds.item():.4f} kp:{loss_kp.item():.4f} rec:{loss_rec.item():.4f}")
+            self.progress_bar.set_description(f"[Iter {iter_idx}] loss:{loss.item():.4f} inv:{loss_inv.item():.4f} var:{loss_var.item():.4f} ds:{loss_ds.item():.4f} kp:{loss_kp.item():.4f} rec:{loss_rec.item():.4f}")
 
             # 10. 定期保存 checkpoint
             if (iter_idx+1) % 2000 == 0 and self.cpkt_save_path is not None:
@@ -337,6 +350,9 @@ class TrainerMultiView:
             self.writer.add_scalar('Loss/reliability', loss_kp.item(), iter_idx)
             self.writer.add_scalar('Loss/variance', loss_var.item(), iter_idx)
 
+
+
+                
             
             
             
