@@ -5,9 +5,12 @@ from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
 import time
 import matplotlib.pyplot as plt
+import glob
 from matplotlib.patches import Circle
+import tqdm
 
-from modules.sfm_dataset import SfMDataset
+from modules.megadepth.megadepth import MegaDepthDataset
+from modules.megadepth.megadepth_wraper import *
 from modules.sfm_loader import *
 from modules.utils import *
 
@@ -15,7 +18,16 @@ from methods.EmbPose.varkpnetmodel import VarianceKPNetModel
 
 from methods.EmbPose.loss import *
 
+def to_numpy_image(img):
+    # Tensor → numpy
+    if isinstance(img, torch.Tensor):
+        img = img.cpu().numpy()
 
+    # (C,H,W) → (H,W,C)
+    if img.ndim == 3 and img.shape[0] in [1, 3]:
+        img = np.transpose(img, (1, 2, 0))
+
+    return img
 
 def plot_matched_keypoints(image1, keypoints1, image2, keypoints2,
                            point_color='r', line_color='b', point_size=40, show_axis=False):
@@ -37,12 +49,28 @@ def plot_matched_keypoints(image1, keypoints1, image2, keypoints2,
         keypoints1 = keypoints1.cpu().numpy()
     if isinstance(keypoints2, torch.Tensor):
         keypoints2 = keypoints2.cpu().numpy()
+    
+    if isinstance(image1, torch.Tensor):
+        image1 = image1.cpu().numpy()
+    if isinstance(image2, torch.Tensor):
+        image2 = image2.cpu().numpy()
 
     # 如果是灰度图，保证是 HxW
     if len(image1.shape) == 2:
         image1 = np.stack([image1]*3, axis=-1)
     if len(image2.shape) == 2:
         image2 = np.stack([image2]*3, axis=-1)
+    
+    image1 = to_numpy_image(image1)
+    image2 = to_numpy_image(image2)
+    
+    # ========= ⭐ 3. 随机采样匹配 =========
+    num_matches = keypoints1.shape[0]
+
+    if num_matches > 50:
+        idx = np.random.choice(num_matches, 50, replace=False)
+        keypoints1 = keypoints1[idx]
+        keypoints2 = keypoints2[idx]
 
     # 并排显示两幅图
     h1, w1 = image1.shape[:2]
@@ -133,9 +161,17 @@ class TrainerMultiView:
         
         self.camera_infos = camera_infos
 
-        self.dataset = SfMDataset(points, images, camera_infos, datapath)
+        #self.dataset = SfMDataset(points, images, camera_infos, datapath)
+        megadepth_datapath = "datasets/MegaDepth_v1"
+        npz_root = "datasets/scene_info_0.1_0.7"
+        npzpaths = glob.glob(npz_root+ '/*.npz')[:]
+        npzpaths = ['datasets/scene_info_0.1_0.7/0022_0.1_0.3.npz','datasets/scene_info_0.1_0.7/0022_0.3_0.5.npz', 'datasets/scene_info_0.1_0.7/0022_0.5_0.7.npz' ]
+        self.dataset = torch.utils.data.ConcatDataset( [MegaDepthDataset(root_dir = megadepth_datapath,
+                            npz_path = path) for path in tqdm.tqdm(npzpaths, desc="[MegaDepth] Loading metadata")] )
+        
+        
         self.data_loader = torch.utils.data.DataLoader(
-            self.dataset, batch_size=1, shuffle=True, collate_fn=sfm_collate_fn
+            self.dataset, batch_size=2, shuffle=True
         )
         self.optimizer = torch.optim.Adam(
             filter(lambda x: x.requires_grad, self.kpnet.parameters()), lr=3e-4
@@ -145,23 +181,29 @@ class TrainerMultiView:
         self.cpkt_save_path = cpkt_save_path
         self.top_k = top_k
         
-        self.progress_bar = tqdm(range(0, self.num_iters), desc="Training progress")
+        self.progress_bar = tqdm.tqdm(range(0, self.num_iters), desc="Training progress")
         self.writer = SummaryWriter(cpkt_save_path + f'/logdir/scr_kpdect_' + time.strftime("%Y_%m_%d-%H_%M_%S"))
 
 
-    def train_iters(self, B=6, patch=3):
+    def train_iters(self):
         self.kpnet.train()
         data_iter = iter(self.data_loader)
 
         for iter_idx in range(self.num_iters):
             try:
-                batch_data = [next(data_iter) for _ in range(B)]
+                batch_data = next(data_iter)
             except StopIteration:
                 data_iter = iter(self.data_loader)
-                batch_data = [next(data_iter) for _ in range(B)]
-            
-            # batch_data[v] 是 list, batch_size=1
-            batch_data = [b[0] for b in batch_data]  # 去掉最外层 list
+                batch_data = next(data_iter)
+            print("batch data = ", batch_data)
+                
+            if batch_data is not None:
+                p1, p2 = batch_data['image0'], batch_data['image1']
+                print("p1 shape = ", p1.shape)
+                positives_md_coarse = spvs_coarse(batch_data, 1)
+                pts1, pts2 = positives_md_coarse[0][:, :2], positives_md_coarse[0][:, 2:]
+                plot_matched_keypoints(p1[0], pts1, p2[0], pts2)
+                
 
             # 读取 image_ids 和 coords
             all_image_ids = [b['image_ids'].to(self.device) for b in batch_data]  # [V, num_sample]
@@ -247,18 +289,7 @@ class TrainerMultiView:
             poses_tensor = torch.stack(poses, dim=0)
             sf_tensor = torch.stack(sf_list, dim=0)   # [B,V,C]
             
-            
-            print("A diff:", (1 - F.cosine_similarity(
-                sf_tensor[:,0],
-                sf_tensor[:,1],
-                dim=1)).mean())
-
-            print("B diff:", (1 - F.cosine_similarity(
-                desc_tensor[:,0],
-                desc_tensor[:,1],
-                dim=1)).mean())
-            
-            
+                       
             loss_inv = descriptor_invariance_loss(
                 desc_tensor,
                 var_tensor,
