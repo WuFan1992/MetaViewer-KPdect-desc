@@ -72,19 +72,19 @@ def warp_kpts(kpts0, depth0, depth1, T_0to1, K0, K1):
     return valid_mask, w_kpts0
 
 
-@torch.no_grad()
 def spvs_coarse_multi_cycle(data, scale=8, cycle_thresh=1.5):
     """
     5-view multi-view + cycle consistency
+    支持 batch >= 1
     """
-
     device = data['images'][0].device
+    B = data['images'][0].shape[0]  # batch size
 
-    images = data['images']
-    depths = data['depths']
-    Ks = data['Ks']
-    T_0to = data['T_0to']
-    scales = data['scales']
+    images = data['images']  # list of 5 tensors [B, C, H, W]
+    depths = data['depths']  # list of 5 tensors [B, H, W]
+    Ks = data['Ks']          # list of 5 tensors [B, 3, 3]
+    T_0to = data['T_0to']    # list of 5 tensors [B, 4, 4]
+    scales = data['scales']   # list of 5 tensors [B] 或 float
 
     ref_img = images[0]
     ref_depth = depths[0]
@@ -94,68 +94,51 @@ def spvs_coarse_multi_cycle(data, scale=8, cycle_thresh=1.5):
     h, w = H // scale, W // scale
 
     # ===== 1. grid =====
-    grid = create_meshgrid(h, w, False, device).reshape(1, h*w, 2)
-    grid_i = scale * grid  # [1, L, 2]
+    grid = create_meshgrid(h, w, False, device).reshape(1, h*w, 2)  # [1, L, 2]
+    grid_i = grid.repeat(B, 1, 1) * scale                            # [B, L, 2]
 
-    valid_all = torch.ones((1, h*w), dtype=torch.bool, device=device)
+    valid_all = torch.ones((B, h*w), dtype=torch.bool, device=device)
     all_points = [grid_i]
 
-    # ===== 2. 对每个 view 做 cycle consistency =====
-    for i in range(1, 5):
-
-        # ---------- forward ----------
+    # ===== 2. cycle consistency for each view =====
+    V = len(images)
+    for i in range(1, V):
         valid_fw, warped_fw = warp_kpts(
-            grid_i,
-            ref_depth,
-            depths[i],
-            T_0to[i],
-            ref_K,
-            Ks[i]
+            grid_i, ref_depth, depths[i], T_0to[i], ref_K, Ks[i]
         )
 
-        # ---------- backward ----------
         T_i_to_0 = torch.inverse(T_0to[i])
-
         valid_bw, warped_bw = warp_kpts(
-            warped_fw,
-            depths[i],
-            ref_depth,
-            T_i_to_0,
-            Ks[i],
-            ref_K
+            warped_fw, depths[i], ref_depth, T_i_to_0, Ks[i], ref_K
         )
 
-        # ---------- cycle consistency ----------
         dist = torch.norm(grid_i - warped_bw, dim=-1)
-
         mask_cycle = dist < cycle_thresh
 
-        # ---------- 合并mask ----------
         valid = valid_fw & valid_bw & mask_cycle
-
         valid_all &= valid
-
         all_points.append(warped_fw)
 
     # ===== 3. final filtering =====
-    final_mask = valid_all[0]
+    multi_corrs_batch = []
+    for b in range(B):
+        final_mask = valid_all[b]
+        if final_mask.sum() == 0:
+            multi_corrs_batch.append(torch.empty((0, 5, 2), device=device))
+            continue
 
-    if final_mask.sum() == 0:
-        return []
+        pts = []
+        for p in all_points:
+            pts.append(p[b, final_mask])
+        multi_corrs = torch.stack(pts, dim=1)  # [num_points, 5, 2]
 
-    # ===== 4. assemble =====
-    pts = []
-    for p in all_points:
-        pts.append(p[0, final_mask])
+        # ===== 4. scale 回原图 =====
+        for i in range(5):
+            multi_corrs[:, i] /= scales[i][b] if isinstance(scales[i], torch.Tensor) else scales[i]
 
-    # [num_points, 5, 2]
-    multi_corrs = torch.stack(pts, dim=1)
+        multi_corrs_batch.append(multi_corrs)
 
-    # ===== 5. scale 回原图 =====
-    for i in range(5):
-        multi_corrs[:, i] /= scales[i]
-
-    return multi_corrs
+    return multi_corrs_batch  # list of length B, 每个元素 [num_points, 5, 2]
 
     """
     multi_coors: [N, 5, 2]

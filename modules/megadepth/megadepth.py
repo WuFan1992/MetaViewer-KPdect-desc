@@ -101,6 +101,7 @@ class MegaDepthDataset(Dataset):
         self.img_padding = img_padding
         self.depth_max_size = 2000 if depth_padding else None  # the upperbound of depthmaps size in megadepth.
         self.min_overlap_score = min_overlap_score
+        self.max_overlap_score = max_overlap_score
         
         
         # 兼容 D2 Net 的路径格式
@@ -113,8 +114,9 @@ class MegaDepthDataset(Dataset):
     
     # Sample 5 views from 
     def sample_five_views(self, anchor):
-        neighbors = [j for j, o in self.graph[anchor] if o > self.min_overlap_score]
-
+        neighbors = [j for j, o in self.graph[anchor] if o > self.min_overlap_score and o < self.max_overlap_score  ]
+        
+        
         if len(neighbors) < 4:
             return None
 
@@ -173,6 +175,7 @@ class MegaDepthDataset(Dataset):
             'depths': depths,     # list of 5 (H,W)
             'Ks': Ks,             # list of 5 (3,3)
             'T_0to': T_0to,       # list of 5 (4,4)
+            'T': poses,
             'scales': scales,
             'dataset_name': 'MegaDepth',
             'scene_id': self.scene_id,

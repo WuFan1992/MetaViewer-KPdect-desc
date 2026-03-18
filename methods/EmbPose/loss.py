@@ -132,32 +132,154 @@ def compute_multi_view_variance(desc_stack):
 
     return var_gt.detach()
 
-def descriptor_invariance_loss(desc_tensor, var_tensor=None, var_thresh=0.1):
-    B, V, C = desc_tensor.shape
+import torch.nn as nn
+class MultiViewDualSoftmaxLoss(nn.Module):
+    def __init__(self, init_temp=0.2):
+        super().__init__()
 
-    # L2 normalize descriptor + 微小噪声
-    desc_tensor = F.normalize(desc_tensor + 1e-3 * torch.randn_like(desc_tensor), dim=2)
+        # ✅ learnable temperature（用 log 更稳定）
+        self.log_temp = nn.Parameter(torch.log(torch.tensor(init_temp)))
 
-    loss = 0.0
-    count = 0
+    def forward(self, desc, var):
+        """
+        desc: [N, V, C]  (已 or 未 normalize 都可以，内部会 normalize)
+        var:  [N, V, 1]
 
-    for i in range(V):
-        for j in range(i+1, V):
-            cos = F.cosine_similarity(desc_tensor[:, i], desc_tensor[:, j], dim=1)  # [B]
-            pair_loss = 1 - cos  # [B]
+        return:
+            loss
+            conf: [N, V]
+        """
 
-            # 初始阶段去掉 mask
-            if var_tensor is not None:
-                var = 0.5 * (var_tensor[:, i, 0] + var_tensor[:, j, 0])
-                mask = torch.sigmoid(10 * (var_thresh - var))  # [0,1]
-                pair_loss = pair_loss * mask
+        N, V, C = desc.shape
 
-            loss += pair_loss.sum()  # 用 sum 而不是 mean
-            count += B
+        # ✅ normalize（非常重要）
+        desc = F.normalize(desc, dim=2)
 
-    loss /= count
-    return loss
+        temp = torch.exp(self.log_temp).clamp(0.01, 10.0)
+
+        total_loss = 0.0
+        total_pairs = 0
+
+        conf_accum = torch.zeros(N, V, device=desc.device)
+
+        for i in range(V):
+            for j in range(i + 1, V):
+
+                Xi = desc[:, i, :]   # [N, C]
+                Xj = desc[:, j, :]   # [N, C]
+
+                var_i = var[:, i, 0]   # [N]
+                var_j = var[:, j, 0]   # [N]
+                
+                # clamp variance
+                var_i = torch.clamp(var_i, 1e-3, 1e2)
+                var_j = torch.clamp(var_j, 1e-3, 1e2)
+
+                # =========================
+                # similarity
+                # =========================
+                sim = (Xi @ Xj.t()) * temp   # [N, N]
+
+                log_p_ij = F.log_softmax(sim, dim=1)
+                log_p_ji = F.log_softmax(sim.t(), dim=1)
+
+                target = torch.arange(N, device=desc.device)
+
+                # =========================
+                # ✅ variance weighting
+                # =========================
+                # 每个点一个 weight
+                weight = 1.0 / (var_i + var_j + 1e-6)   # [N]
+                weight = weight / (weight.mean().detach() + 1e-6)
+
+                loss_ij = F.nll_loss(log_p_ij, target, reduction='none')  # [N]
+                loss_ji = F.nll_loss(log_p_ji, target, reduction='none')  # [N]
+
+                loss_ij = (loss_ij * weight).mean()
+                loss_ji = (loss_ji * weight).mean()
+
+                total_loss += (loss_ij + loss_ji)
+                total_pairs += 1
+
+                # =========================
+                # confidence（给 reliability 用）
+                # =========================
+                with torch.no_grad():
+                    p_ij = torch.exp(log_p_ij)
+                    p_ji = torch.exp(log_p_ji)
+
+                    conf_i = p_ij.max(dim=1)[0]   # [N]
+                    conf_j = p_ji.max(dim=1)[0]
+
+                    conf_accum[:, i] += conf_i
+                    conf_accum[:, j] += conf_j
+
+        loss = total_loss / total_pairs
+
+        conf = conf_accum / (V - 1)
+
+        return loss, conf
+
+class MultiViewVarianceLoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, desc, var):
+        """
+        desc: [N, V, C]
+        var:  [N, V, 1]
+        """
+
+        desc = F.normalize(desc, dim=2)
+
+        # ===== multi-view mean =====
+        mu = desc.mean(dim=1, keepdim=True).detach()   # [N,1,C]
+
+        # ===== error =====
+        error = ((desc - mu) ** 2).sum(dim=2)   # [N,V]
+
+        # ===== variance =====
+        var = var.squeeze(-1)   # [N,V]
+        var = torch.clamp(var, 1e-3, 1e2)
+
+        # ===== loss =====
+        loss = error / var + torch.log(var)
+
+        return loss.mean()
     
+class MultiViewReconstructionLoss(nn.Module):
+    def __init__(self):
+        super().__init__()
 
+    def forward(self, kpnet, desc_list, sf_list, T_list):
+        """
+        desc_list: list of [N, V, C]
+        sf_list: list of [N, V, C]
+        T_list: list of V torch tensors [4,4] (相对 pose)
+        """
+        loss_total = 0.0
+        count = 0
+
+        for b in range(len(desc_list)):
+            desc = desc_list[b]  # [N,V,C]
+            sf   = sf_list[b]    # [N,V,C]
+            V    = desc.shape[1]
+
+            for i in range(V):
+                for j in range(V):
+                    if i == j:
+                        continue
+                    # i -> j
+                    # kpnet 重建 j 的 sf
+                    sf_recon = kpnet.reconstruction(desc[:,i,:], T_list[i], T_list[j])  # [N,C]
+                    sf_target = sf[:,j,:]  # [N,C]
+
+                    loss_total += F.mse_loss(sf_recon, sf_target)
+                    count += 1
+
+        if count > 0:
+            return loss_total / count
+        else:
+            return torch.tensor(0.0, device=desc_list[0].device)
 
 

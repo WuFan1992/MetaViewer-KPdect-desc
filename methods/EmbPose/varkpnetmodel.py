@@ -108,8 +108,8 @@ class SharedBackbone(nn.Module):
                 p.requires_grad = False
 
     def forward(self, x):
-
-        feat = self.backbone(x)   # [B,256,H/4,W/4]
+        with torch.no_grad():
+            feat = self.backbone(x)   # [B,256,H/4,W/4]
         feat = self.proj(feat)    # [B,out_dim,H/4,W/4]
 
         return feat
@@ -305,20 +305,42 @@ class VarianceKPNetModel(nn.Module):
         self.decoder = PointDecoder(feature_dim)
         
     
-    def reconstruction(self,
-                   desc_src,
-                   pose_src,
-                   pose_tgt):
+    def reconstruction(self, desc_src, pose_src, pose_tgt):
         """
-        desc_src: [B,C]
-        pose_src: [B,4,4]
-        pose_tgt: [B,4,4]
+        desc_src: [N, C]
+        pose_src: [4,4] or [B,4,4]
+        pose_tgt: [4,4] or [B,4,4]
         """
+        device = desc_src.device
+
+        # 确保 pose dtype 和 device
+        pose_src = pose_src.to(device).float()
+        pose_tgt = pose_tgt.to(device).float()
+
+        # 处理单张 pose
+        if pose_src.dim() == 2:
+            pose_src = pose_src.unsqueeze(0)
+        if pose_tgt.dim() == 2:
+            pose_tgt = pose_tgt.unsqueeze(0)
 
         # relative pose
-        pose_ij = pose_matrix_to_9d(pose_src, pose_tgt)
+        pose_ij = pose_matrix_to_9d(pose_src, pose_tgt)  # [B,9]
+        pose_ij = pose_ij.to(device).float()
 
-        pose_embed = self.pose_encoder(pose_ij)
+        # pose embedding
+        pose_embed = self.pose_encoder(pose_ij)  # [B,D]
+
+        # ---- 核心修改 ----
+        if pose_embed.dim() == 1:
+            pose_embed = pose_embed.unsqueeze(0)  # [1,D]
+
+        # 如果 pose_embed batch >1, 取平均
+        if pose_embed.shape[0] > 1:
+            pose_embed = pose_embed.mean(dim=0, keepdim=True)  # [1,D]
+
+        # 广播到关键点数
+        N = desc_src.shape[0]
+        pose_embed = pose_embed.expand(N, -1)  # [N,D]
 
         # FiLM modulation
         latent = self.film(desc_src, pose_embed)
@@ -327,7 +349,6 @@ class VarianceKPNetModel(nn.Module):
 
         # decoder
         pred_desc = self.decoder(latent)
-
         pred_desc = F.normalize(pred_desc, dim=1)
 
         return pred_desc

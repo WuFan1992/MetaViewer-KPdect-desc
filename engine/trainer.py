@@ -6,7 +6,6 @@ from torch.utils.tensorboard import SummaryWriter
 import time
 import matplotlib.pyplot as plt
 import glob
-from matplotlib.patches import Circle
 import tqdm
 
 from modules.megadepth.megadepth import MegaDepthDataset
@@ -156,37 +155,6 @@ def sfm_collate_fn(batch):
     return batch_data0, batch_data1, matches_list
 
 
-import matplotlib.pyplot as plt
-import torchvision.transforms.functional as TF
-
-
-def visualize_group_points(imgs, coords, title=""):
-    """
-    imgs: list of [3,H,W] tensor, 每张图
-    coords: list of [2] tensor, 每张图对应的一个点 [y,x]
-    """
-    V = len(imgs)
-    fig, axes = plt.subplots(1, V, figsize=(4*V, 4))
-    
-    if V == 1:
-        axes = [axes]
-    
-    for i in range(V):
-        img = imgs[i].cpu().permute(1,2,0).numpy()  # CHW -> HWC
-        # 反归一化（ImageNet）
-        img = img * np.array([0.229,0.224,0.225]) + np.array([0.485,0.456,0.406])
-        img = np.clip(img, 0, 1)
-        axes[i].imshow(img)
-        
-        yx = coords[i].cpu().numpy()
-        x, y = yx[0], yx[1]
-        axes[i].scatter(x, y, s=80, c='r', marker='x')
-        axes[i].set_title(f"Image {i}")
-        axes[i].axis('off')
-    
-    plt.suptitle(title)
-    plt.show()
-
 def sfm_collate_fn(batch):
     return batch  # batch 是 list，每个元素就是 dict
 
@@ -210,11 +178,18 @@ class TrainerMultiView:
         
         
         self.data_loader = torch.utils.data.DataLoader(
-            self.dataset, batch_size=1, shuffle=True
+            self.dataset, batch_size=2, shuffle=True
         )
         self.optimizer = torch.optim.Adam(
             filter(lambda x: x.requires_grad, self.kpnet.parameters()), lr=3e-4
         )
+        
+        
+        # Loss
+        self.desc_loss_fn = MultiViewDualSoftmaxLoss()
+        self.var_loss_fn = MultiViewVarianceLoss()
+        self.recon_loss_fn = MultiViewReconstructionLoss()
+        
         self.scheduler = torch.optim.lr_scheduler.StepLR(self.optimizer, step_size=30000, gamma=0.5)
         self.num_iters = num_iters
         self.cpkt_save_path = cpkt_save_path
@@ -235,181 +210,189 @@ class TrainerMultiView:
                 data_iter = iter(self.data_loader)
                 batch_data = next(data_iter)
             
-                
+            images = batch_data['images']
+            H_orig, W_orig = images[0].shape[2:]
+            
             # ===== 1. 生成 multi-view 对应点 =====
-            multi_corrs = spvs_coarse_multi_cycle(batch_data, scale=4)
+            multi_corrs = spvs_coarse_multi_cycle(batch_data, scale=4) # 这里的坐标已经返回原图尺寸下了
+            V = len(images)  # V 是每一个 batch 里面有多少个view, 默认是5
+            B = len(multi_corrs)  # B 是batch 数
 
             # ===== 2. 可视化=====
             # ===== 关键：正确取 batch 第一个样本 =====
+            """
             images = []
             for img in batch_data['images']:
                 if isinstance(img, torch.Tensor) and img.dim() == 4:
                     images.append(img[0])   # [B,C,H,W] -> [C,H,W]
                 else:
                     images.append(img)
-
+            # multi_corrs 也取 batch=0
+            multi_corrs_b = multi_corrs[0]  # [num_points, 5, 2]
             # ===== 调用可视化 =====
             plot_multi_view_matches(
                 images,
-                multi_corrs,
+                multi_corrs_b,
                 max_points=50,
                 save_path=None  # 或 f"debug_{iter_idx}.png"
             )
             
-
-            # 读取 image_ids 和 coords
-            all_image_ids = [b['image_ids'].to(self.device) for b in batch_data]  # [V, num_sample]
-            all_coords = [b['coords'].to(self.device) for b in batch_data]        # [V, num_sample,2]
             """
-            print("all_imag_ids[0] = ", all_image_ids[0])
-            image_ids = all_image_ids[0].cpu().numpy()
-            names = [self.camera_infos["image_name_list"][i] for i in image_ids]
-            print("all_image_ids 0 names =", names)
-            """
-            # 读取图像并计算 descriptor
-            imgs = []
-            poses = []
-            raw_imgs = [] 
-            for b in range(B):
-                img_batch = []
-                pose_batch = []
-                raw_img_batch=[]
-                for img_id in all_image_ids[b]:
-                    img = self.dataset.get_img(img_id.item()).to(self.device)
-                    pose = self.dataset.get_pose(img_id).to(self.device)
-                    raw_img =self.dataset.get_raw_img(img_id.item()).to(self.device) 
-                    img_batch.append(img)
-                    pose_batch.append(pose)
-                    raw_img_batch.append(raw_img)
-                imgs.append(torch.stack(img_batch, dim=0))  # [num_sample, C,H,W]
-                poses.append(torch.stack(pose_batch, dim=0))  # [num_sample, pose_dim]
-                raw_imgs.append(torch.stack(raw_img_batch, dim=0))
-            ################################################## 
-            """
-            from matplotlib.patches import Circle   
-
-
-            # 创建一个 figure，每张图片一个子图
-            fig, axes = plt.subplots(1, B, figsize=(5*B, 5))
-
-            if B == 1:
-                axes = [axes]  # 保证是 list
-
-            for i in range(5):
-                img = raw_imgs[0][i].permute(1,2,0).cpu().numpy()  # H x W x C
-                axes[i].imshow(img)
-                axes[i].axis('off')
-    
-                # 在对应 coords 上画圆圈
-                x, y = all_coords[0][i].cpu().numpy()
-                circ = Circle((x, y), radius=10, edgecolor='red', facecolor='none', linewidth=2)
-                axes[i].add_patch(circ)
-
-            plt.show()
-            """
-            #############################################################       
-            H_orig, W_orig = imgs[0].shape[2:]     
-            # 假设 kpnet.forward(imgs) 返回 shared_feats, desc_maps, variance_maps, reliability_maps
+               
+            
             shared_feats, desc_maps, variance_maps, reliability_maps = [], [], [], []
-            for b in range(B):
-                sf, var, desc, rel = self.kpnet(imgs[b])  # imgs[v]: [num_sample,C,H,W]
+            # 先遍历每一个view ,每一个view 通过一次网络，上面每一个容器都有V 个元素
+            for v in range(V):
+                sf, var, desc, rel = self.kpnet(images[v].to(self.device))  # images[v] shape = [B,3,608,800]  desc shape = [B,64,152,200]
                 shared_feats.append(sf)
                 desc_maps.append(desc)
                 variance_maps.append(var)
                 reliability_maps.append(rel)
+                        
 
-
-            # 对每个 3D 点采样 descriptor & variance
-            # 这里假设每个 3D 点在不同图像上对应 coords
+            # 接着遍历Batch，每一个batch 计算一次损失函数 以下的容器每个容器B 个元素
             desc_list, var_list, rel_list, sf_list = [], [], [], []
+
             for b in range(B):
-                # sample_map_at_coords(desc_map, coords) 返回 [num_sample, C]
-                desc_list.append(sample_map_at_coords(desc_maps[b], all_coords[b], H_orig, W_orig))
-                var_list.append(sample_map_at_coords(variance_maps[b], all_coords[b], H_orig, W_orig))
-                rel_list.append(sample_map_at_coords(reliability_maps[b], all_coords[b], H_orig, W_orig))
-                sf_list.append(sample_map_at_coords(shared_feats[b], all_coords[b], H_orig, W_orig))
+                corrs = multi_corrs[b]   # [N, 5, 2]
+                if corrs.shape[0] == 0:
+                    continue
 
-        
-            # Multi-view soft patch matching
-            loss_ds, conf_all = 0, []
-            num_sample = desc_list[0].shape[0]
-            desc_tensor = torch.stack(desc_list, dim=0)
-            var_tensor = torch.stack(var_list, dim=0)
-            rel_tensor = torch.stack(rel_list, dim=0)
-            coords_tensor = torch.stack(all_coords, dim=0)
-            desc_map_tensor = torch.stack(desc_maps, dim=0)
-            poses_tensor = torch.stack(poses, dim=0)
-            sf_tensor = torch.stack(sf_list, dim=0)   # [B,V,C]
-            
-                       
-            loss_inv = descriptor_invariance_loss(
-                desc_tensor,
-                var_tensor,
-                var_thresh=0.1
-            )
-            
+                desc_per_point = []
+                var_per_point = []
+                rel_per_point = []
+                sf_per_point = []
 
-            loss_ds, conf_all = viewpoint_guide_ds_loss(desc_tensor, desc_map_tensor, coords_tensor, H_orig, W_orig, patch)
-            conf_target = torch.stack(conf_all).mean(0).detach()
+                # ===== 遍历5个view =====
+                for v in range(V):
 
-            # Reliability supervision
-            loss_kp = sum([reliability_loss(rel_tensor[:,n], conf_target) for n in range(num_sample)]) / num_sample
-            
+                    coords = corrs[:, v, :].to(self.device)   # [N,2]
 
-            
-             # ===== viewpoint-guided variance supervision =====
-            desc_stack = desc_tensor.permute(1,0,2)  # [V,B,C]
-            var_gt = compute_multi_view_variance(desc_stack)  # [B]
-            var_pred = var_tensor.mean(1).squeeze(-1)  # [B]
-            # 1. variance loss (只在 warm-up 后开启)
-            if iter_idx >0: # warmup
-                loss_var = F.smooth_l1_loss(var_pred, var_gt)
+                    # 取第 b 个 batch 的 feature map
+                    desc_map_b = desc_maps[v][b:b+1]   # [1,C,H,W]
+                    var_map_b  = variance_maps[v][b:b+1]
+                    rel_map_b  = reliability_maps[v][b:b+1]
+                    sf_map_b   = shared_feats[v][b:b+1]
+
+                    # 采样 → [N,C]
+                    desc_sample = sample_map_at_coords(desc_map_b, coords, H_orig, W_orig)
+                    var_sample  = sample_map_at_coords(var_map_b, coords, H_orig, W_orig)
+                    rel_sample  = sample_map_at_coords(rel_map_b, coords, H_orig, W_orig)
+                    sf_sample   = sample_map_at_coords(sf_map_b, coords, H_orig, W_orig)
+
+                    desc_per_point.append(desc_sample)
+                    var_per_point.append(var_sample)
+                    rel_per_point.append(rel_sample)
+                    sf_per_point.append(sf_sample)
+
+                # ===== stack 成 multi-view =====
+                # [N, 5, C]
+                desc_per_point = torch.stack(desc_per_point, dim=1)
+                var_per_point  = torch.stack(var_per_point, dim=1)
+                rel_per_point  = torch.stack(rel_per_point, dim=1)
+                sf_per_point   = torch.stack(sf_per_point, dim=1)
+                
+
+                desc_list.append(desc_per_point)
+                var_list.append(var_per_point)
+                rel_list.append(rel_per_point)
+                sf_list.append(sf_per_point)
+
+                               
+            # =========================
+            # 3. 统一计算 loss
+            # =========================
+            loss_desc_total = 0.0
+            loss_var_total = 0.0
+            loss_rel_total = 0.0
+            loss_recon_total = 0.0
+
+            valid_batch = 0
+
+            for b in range(len(desc_list)):
+
+                desc = desc_list[b]   # [N, V, C]
+                var  = var_list[b]    # [N, V, 1]
+                rel  = rel_list[b]    # [N, V, 1]
+
+                if desc.shape[0] == 0:
+                    continue
+
+                # =========================
+                # 1. descriptor loss
+                # =========================
+                loss_desc_b, conf = self.desc_loss_fn(desc, var)
+
+                # =========================
+                # 2. variance loss（🔥新加）
+                # =========================
+                loss_var_b = self.var_loss_fn(desc, var)
+
+                # =========================
+                # 3. reliability loss
+                # =========================
+                rel_pred = rel.squeeze(-1)   # [N,V]
+
+                conf = conf.clamp(0.01, 0.99)
+
+                loss_rel_b = F.binary_cross_entropy(rel_pred, conf.detach())
+                
+                # =========================
+                # 4. reconstruction loss
+                # =========================
+                T_list = batch_data['T']  # 每个 view 的 pose list
+                for i in range(V):
+                    for j in range(V):
+                        if i == j:
+                            continue
+
+                        desc_b_i = desc[:, i, :]       # [N_i, C]
+                        sf_b_j   = sf_list[b][:, j, :] # [N_i, C]
+
+                        # 单张图 pose
+                        pose_i = T_list[i][b].to(self.device)  # [4,4]
+                        pose_j = T_list[j][b].to(self.device)  # [4,4]
+
+                        sf_recon = self.kpnet.reconstruction(desc_b_i, pose_i, pose_j)  # [N_i,C]
+
+                        loss_recon_total += F.mse_loss(sf_recon, sf_b_j)
+
+                # =========================
+                # accumulate
+                # =========================
+                loss_desc_total += loss_desc_b
+                loss_var_total  += loss_var_b
+                loss_rel_total  += loss_rel_b
+
+                valid_batch += 1
+
+
+            # =========================
+            # 4. normalize
+            # =========================
+            if valid_batch > 0:
+                loss_desc = loss_desc_total / valid_batch
+                loss_var  = loss_var_total  / valid_batch
+                loss_rel  = loss_rel_total  / valid_batch
+                loss_recon = loss_recon_total / valid_batch
             else:
-                loss_var = torch.tensor(0.0, device=self.device)
+                loss_desc = torch.tensor(0.0, device=self.device)
+                loss_var  = torch.tensor(0.0, device=self.device)
+                loss_rel  = torch.tensor(0.0, device=self.device)
+                loss_recon = torch.tensor(0., device=self.device)
 
-
-            # Reconstruction loss
-            # ===== cross-view reconstruction =====
-            loss_rec = 0.0
-            _, V, _ = desc_tensor.shape
+            # Reconstruction Loss
+            T_list = [T.to(self.device, dtype=torch.float) for T in batch_data['T']]
+            loss_recon = self.recon_loss_fn(self.kpnet, desc_list, sf_list, T_list)
+            # =========================
+            # 5. final loss（🔥建议权重）
+            # =========================
+            if iter_idx < 2000:
+                loss = loss_desc   # 先只训 descriptor
+            else:
+                loss = loss_desc + 0.2 * loss_var + 0.5 * loss_rel + 0.3 * loss_recon
             
-            
-            for v in range(V):
-                for u in range(V):
-                    if u == v:
-                        continue
 
-                    # source descriptor: batch 内所有样本，第 u 个 view
-                    desc_src = desc_tensor[:, u]  # [B, C]
-                    sf_tgt = sf_tensor[:, v].detach()  # [B, C]
-
-                    # 加入一点点噪声 ，防止学习decoder(x) = x
-                    desc_src = desc_src + 0.02 * torch.randn_like(desc_src)
-
-                    # cross-view reconstruction
-                    pred_desc = self.kpnet.reconstruction(
-                        desc_src=desc_src,
-                        pose_src=poses_tensor[:, u],  # [B, 4, 4]
-                        pose_tgt=poses_tensor[:, v]   # [B, 4, 4]
-                    )
-
-                    # cosine reconstruction loss with variance weighting
-                    var_weight = torch.exp(-var_tensor[:, v, 0])  # [B]
-                    loss_rec += (var_weight * (1 - F.cosine_similarity(pred_desc, sf_tgt, dim=1))).mean()
-
-            # 平均到 V*(V-1) 个 view pair
-            loss_rec /= V*(V-1)
-            
-            # 总 loss
-            w_var, w_ds, w_kp, w_rec, w_inv = 0.2, 0.1, 5, 0.5, 1.0
-
-            loss = (
-                w_var * loss_var +
-                w_ds  * loss_ds  +
-                w_kp  * loss_kp  +
-                w_rec * loss_rec +
-                w_inv * loss_inv
-            )
             
             # backward
             loss.backward()
@@ -418,7 +401,7 @@ class TrainerMultiView:
             self.optimizer.zero_grad()
             self.scheduler.step()
 
-            self.progress_bar.set_description(f"[Iter {iter_idx}] loss:{loss.item():.4f} inv:{loss_inv.item():.4f} var:{loss_var.item():.4f} ds:{loss_ds.item():.4f} kp:{loss_kp.item():.4f} rec:{loss_rec.item():.4f}")
+            self.progress_bar.set_description(f"[Iter {iter_idx}] loss:{loss.item():.4f} var:{loss_var.item():.4f} ds:{loss_desc.item():.4f} kp:{loss_rel.item():.4f} rec:{loss_recon.item():.4f}")
 
             # 10. 定期保存 checkpoint
             if (iter_idx+1) % 2000 == 0 and self.cpkt_save_path is not None:
@@ -428,9 +411,9 @@ class TrainerMultiView:
             
             # Log metrics
             self.writer.add_scalar('Loss/total', loss.item(), iter_idx)
-            self.writer.add_scalar('Loss/description', loss_ds.item(), iter_idx)
-            self.writer.add_scalar('Loss/recontruction', loss_rec.item(), iter_idx)
-            self.writer.add_scalar('Loss/reliability', loss_kp.item(), iter_idx)
+            self.writer.add_scalar('Loss/description', loss_desc.item(), iter_idx)
+            self.writer.add_scalar('Loss/recontruction', loss_recon.item(), iter_idx)
+            self.writer.add_scalar('Loss/reliability', loss_rel.item(), iter_idx)
             self.writer.add_scalar('Loss/variance', loss_var.item(), iter_idx)
 
 

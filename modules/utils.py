@@ -143,29 +143,41 @@ def pose_matrix_to_7d(pose):
 
     return pose7
 
-def sample_map_at_coords(fmap, coords, H_orig, W_orig):
+def sample_map_at_coords(fmap, coords, H, W):
     """
-    fmap: [B, C, Hf, Wf]
-    coords: [B, 2] (y,x) 原图坐标
-    H_orig, W_orig: 原图大小
-    return: [B, C]
+    fmap:   [1, C, Hc, Wc]
+    coords: [N, 2]  (原图坐标)
+    H, W:   原图尺寸
     """
-    B, C, Hf, Wf = fmap.shape
 
-    # 缩放到 feature map 尺寸
-    coords_scaled = coords.clone().float()    
-    coords_scaled[:, 1] = coords_scaled[:, 1] * (Hf / H_orig)
-    coords_scaled[:, 0] = coords_scaled[:, 0] * (Wf / W_orig)
+    device = fmap.device
+    coords = coords.to(device).float()
 
-    # 归一化到 [-1,1] for grid_sample
-    coords_norm = coords_scaled.clone()
-    coords_norm[..., 0] = coords_norm[..., 0] / (Wf - 1) * 2 - 1
-    coords_norm[..., 1] = coords_norm[..., 1] / (Hf - 1) * 2 - 1
-    
-    coords_norm = coords_norm.unsqueeze(1).unsqueeze(1)  # [B,1,1,2]
+    # ===== ⭐ 1. 先缩放到 feature map 尺度（加在这里） =====
+    _, _, Hc, Wc = fmap.shape
 
-    sampled = F.grid_sample(fmap, coords_norm, mode='bilinear', align_corners=False)
-    sampled = sampled.squeeze(3).squeeze(2)  # [B,C]
+    coords = coords.clone()
+    coords[..., 0] = coords[..., 0] * (Wc / W)
+    coords[..., 1] = coords[..., 1] * (Hc / H)
+
+    # ===== 2. 再 normalize 到 [-1,1] =====
+    coords_norm = coords.clone()
+    coords_norm[..., 0] = coords_norm[..., 0] / (Wc - 1) * 2 - 1
+    coords_norm[..., 1] = coords_norm[..., 1] / (Hc - 1) * 2 - 1
+
+    # ===== 3. reshape =====
+    coords_norm = coords_norm.unsqueeze(0).unsqueeze(2)  # [1, N, 1, 2]
+
+    # ===== 4. grid_sample =====
+    sampled = F.grid_sample(
+        fmap, coords_norm,
+        mode='bilinear',
+        align_corners=False
+    )  # [1, C, N, 1]
+
+    # ===== 5. reshape → [N,C] =====
+    sampled = sampled.squeeze(0).squeeze(-1).transpose(0, 1)
+
     return sampled
 
 
