@@ -189,8 +189,10 @@ class MultiViewDualSoftmaxLoss(nn.Module):
                 # ✅ variance weighting
                 # =========================
                 # 每个点一个 weight
-                weight = 1.0 / (var_i + var_j + 1e-6)   # [N]
-                weight = weight / (weight.mean().detach() + 1e-6)
+                #weight = 1.0 / (var_i + var_j + 1e-6)   # [N]
+                #weight = weight / (weight.mean().detach() + 1e-6)
+                
+                weight = 1
 
                 loss_ij = F.nll_loss(log_p_ij, target, reduction='none')  # [N]
                 loss_ji = F.nll_loss(log_p_ji, target, reduction='none')  # [N]
@@ -231,12 +233,12 @@ class MultiViewVarianceLoss(nn.Module):
         """
 
         desc = F.normalize(desc, dim=2)
+        
+        desc_detached = desc.detach()
 
         # ===== multi-view mean =====
-        mu = desc.mean(dim=1, keepdim=True).detach()   # [N,1,C]
-
-        # ===== error =====
-        error = ((desc - mu) ** 2).sum(dim=2)   # [N,V]
+        mu = desc_detached.mean(dim=1, keepdim=True)
+        error = ((desc_detached - mu) ** 2).sum(dim=2)
 
         # ===== variance =====
         var = var.squeeze(-1)   # [N,V]
@@ -248,8 +250,9 @@ class MultiViewVarianceLoss(nn.Module):
         return loss.mean()
     
 class MultiViewReconstructionLoss(nn.Module):
-    def __init__(self):
+    def __init__(self, device):
         super().__init__()
+        self.device = device
 
     def forward(self, kpnet, desc_list, sf_list, T_list):
         """
@@ -280,6 +283,6 @@ class MultiViewReconstructionLoss(nn.Module):
         if count > 0:
             return loss_total / count
         else:
-            return torch.tensor(0.0, device=desc_list[0].device)
+            return 0.0 * next(kpnet.parameters()).sum()
 
 

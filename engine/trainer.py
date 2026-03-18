@@ -178,7 +178,7 @@ class TrainerMultiView:
         
         
         self.data_loader = torch.utils.data.DataLoader(
-            self.dataset, batch_size=2, shuffle=True
+            self.dataset, batch_size=1, shuffle=True
         )
         self.optimizer = torch.optim.Adam(
             filter(lambda x: x.requires_grad, self.kpnet.parameters()), lr=3e-4
@@ -188,7 +188,7 @@ class TrainerMultiView:
         # Loss
         self.desc_loss_fn = MultiViewDualSoftmaxLoss()
         self.var_loss_fn = MultiViewVarianceLoss()
-        self.recon_loss_fn = MultiViewReconstructionLoss()
+        self.recon_loss_fn = MultiViewReconstructionLoss(self.device)
         
         self.scheduler = torch.optim.lr_scheduler.StepLR(self.optimizer, step_size=30000, gamma=0.5)
         self.num_iters = num_iters
@@ -255,8 +255,19 @@ class TrainerMultiView:
 
             for b in range(B):
                 corrs = multi_corrs[b]   # [N, 5, 2]
-                if corrs.shape[0] == 0:
+                if corrs.shape[0] < 30:
                     continue
+                
+                ######### 限制点数避免在我的PC 机上爆显存，但是实际中应该要删去 ##########
+                # 🔥 限制最大点数
+                max_points = 9000
+                N = corrs.shape[0]
+
+                if N > max_points:
+                    idx = torch.randperm(N)[:max_points]   # 随机采样
+                    corrs = corrs[idx]
+                
+                #############################################################
 
                 desc_per_point = []
                 var_per_point = []
@@ -298,7 +309,9 @@ class TrainerMultiView:
                 rel_list.append(rel_per_point)
                 sf_list.append(sf_per_point)
 
-                               
+            if len(desc_list) == 0:
+                print("⚠️ Skip iteration due to too few correspondences")
+                continue                  
             # =========================
             # 3. 统一计算 loss
             # =========================
@@ -337,25 +350,6 @@ class TrainerMultiView:
 
                 loss_rel_b = F.binary_cross_entropy(rel_pred, conf.detach())
                 
-                # =========================
-                # 4. reconstruction loss
-                # =========================
-                T_list = batch_data['T']  # 每个 view 的 pose list
-                for i in range(V):
-                    for j in range(V):
-                        if i == j:
-                            continue
-
-                        desc_b_i = desc[:, i, :]       # [N_i, C]
-                        sf_b_j   = sf_list[b][:, j, :] # [N_i, C]
-
-                        # 单张图 pose
-                        pose_i = T_list[i][b].to(self.device)  # [4,4]
-                        pose_j = T_list[j][b].to(self.device)  # [4,4]
-
-                        sf_recon = self.kpnet.reconstruction(desc_b_i, pose_i, pose_j)  # [N_i,C]
-
-                        loss_recon_total += F.mse_loss(sf_recon, sf_b_j)
 
                 # =========================
                 # accumulate
@@ -366,7 +360,6 @@ class TrainerMultiView:
 
                 valid_batch += 1
 
-
             # =========================
             # 4. normalize
             # =========================
@@ -374,24 +367,27 @@ class TrainerMultiView:
                 loss_desc = loss_desc_total / valid_batch
                 loss_var  = loss_var_total  / valid_batch
                 loss_rel  = loss_rel_total  / valid_batch
-                loss_recon = loss_recon_total / valid_batch
             else:
-                loss_desc = torch.tensor(0.0, device=self.device)
-                loss_var  = torch.tensor(0.0, device=self.device)
-                loss_rel  = torch.tensor(0.0, device=self.device)
-                loss_recon = torch.tensor(0., device=self.device)
+                loss_desc = 0.0 * next(self.kpnet.parameters()).sum()
+                loss_var  = 0.0 * next(self.kpnet.parameters()).sum()
+                loss_rel  = 0.0 * next(self.kpnet.parameters()).sum()
 
             # Reconstruction Loss
             T_list = [T.to(self.device, dtype=torch.float) for T in batch_data['T']]
             loss_recon = self.recon_loss_fn(self.kpnet, desc_list, sf_list, T_list)
+           
             # =========================
             # 5. final loss（🔥建议权重）
             # =========================
             if iter_idx < 2000:
                 loss = loss_desc   # 先只训 descriptor
             else:
-                loss = loss_desc + 0.2 * loss_var + 0.5 * loss_rel + 0.3 * loss_recon
+                loss = loss_desc + 0.2 * loss_var + 0.5 * loss_rel + 0.7 * loss_recon
             
+            # 🔥 保底（关键）
+            loss = loss + 0.0 * next(self.kpnet.parameters()).sum() 
+            
+
 
             
             # backward
@@ -404,7 +400,7 @@ class TrainerMultiView:
             self.progress_bar.set_description(f"[Iter {iter_idx}] loss:{loss.item():.4f} var:{loss_var.item():.4f} ds:{loss_desc.item():.4f} kp:{loss_rel.item():.4f} rec:{loss_recon.item():.4f}")
 
             # 10. 定期保存 checkpoint
-            if (iter_idx+1) % 2000 == 0 and self.cpkt_save_path is not None:
+            if (iter_idx+1) % 1000 == 0 and self.cpkt_save_path is not None:
                 torch.save(self.kpnet.state_dict(), f"{self.cpkt_save_path}/kpnet_iter_{iter_idx}.pth")
             
             self.progress_bar.update(1)
@@ -436,7 +432,7 @@ class TrainerMultiView:
 if __name__ == "__main__":
     data_path = "datasets/head"
     cpkt_save_path = "checkpoints/"
-    num_iters = 2000
+    num_iters = 5000
     variance_kpnet = VarianceKPNetModel(in_channels=64, pose_dim=9, feature_dim=64, pose_embed=64)
     trainer = TrainerMultiView(variance_kpnet, data_path, cpkt_save_path, num_iters)
     trainer.train_iters()
