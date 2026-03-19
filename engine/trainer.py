@@ -220,7 +220,7 @@ class TrainerMultiView:
 
             # ===== 2. 可视化=====
             # ===== 关键：正确取 batch 第一个样本 =====
-            """
+            
             images = []
             for img in batch_data['images']:
                 if isinstance(img, torch.Tensor) and img.dim() == 4:
@@ -237,7 +237,7 @@ class TrainerMultiView:
                 save_path=None  # 或 f"debug_{iter_idx}.png"
             )
             
-            """
+            
                
             
             shared_feats, desc_maps, variance_maps, reliability_maps = [], [], [], []
@@ -334,7 +334,8 @@ class TrainerMultiView:
                 # =========================
                 # 1. descriptor loss
                 # =========================
-                loss_desc_b, conf = self.desc_loss_fn(desc, var)
+                use_var_weight = iter_idx > 1000
+                loss_desc_b, conf = self.desc_loss_fn(desc, var, use_var_weight)
 
                 # =========================
                 # 2. variance loss（🔥新加）
@@ -379,10 +380,23 @@ class TrainerMultiView:
             # =========================
             # 5. final loss（🔥建议权重）
             # =========================
-            if iter_idx < 2000:
-                loss = loss_desc   # 先只训 descriptor
+            if iter_idx < 300:
+                loss = loss_desc
+
+            elif iter_idx < 500:
+                loss = loss_desc + 0.2 * loss_rel
+
+            elif iter_idx < 800:
+                loss = loss_desc + 0.2 * loss_rel + 0.2 * loss_var
+
             else:
-                loss = loss_desc + 0.2 * loss_var + 0.5 * loss_rel + 0.7 * loss_recon
+                loss = loss_desc + 0.12 * loss_rel + 0.2 * loss_var + 0.2 * loss_recon
+                
+            # 🔥 防止 descriptor collapse（加这里）
+            desc_flat = desc.reshape(-1, desc.shape[-1])
+            std = desc_flat.std(dim=0)
+            loss_std = torch.mean(F.relu(0.5 - std))
+            loss += 0.05 * loss_std
             
             # 🔥 保底（关键）
             loss = loss + 0.0 * next(self.kpnet.parameters()).sum() 
@@ -400,7 +414,7 @@ class TrainerMultiView:
             self.progress_bar.set_description(f"[Iter {iter_idx}] loss:{loss.item():.4f} var:{loss_var.item():.4f} ds:{loss_desc.item():.4f} kp:{loss_rel.item():.4f} rec:{loss_recon.item():.4f}")
 
             # 10. 定期保存 checkpoint
-            if (iter_idx+1) % 1000 == 0 and self.cpkt_save_path is not None:
+            if (iter_idx+1) % 500 == 0 and self.cpkt_save_path is not None:
                 torch.save(self.kpnet.state_dict(), f"{self.cpkt_save_path}/kpnet_iter_{iter_idx}.pth")
             
             self.progress_bar.update(1)

@@ -343,11 +343,7 @@ class VarianceKPNetModel(nn.Module):
         pose_embed = pose_embed.expand(N, -1)  # [N,D]
 
         # FiLM modulation
-        latent = self.film(desc_src, pose_embed)
-
-        latent = F.normalize(latent, dim=1)
-
-        # decoder
+        latent = desc_src + self.film(desc_src, pose_embed)
         pred_desc = self.decoder(latent)
         pred_desc = F.normalize(pred_desc, dim=1)
 

@@ -136,89 +136,67 @@ import torch.nn as nn
 class MultiViewDualSoftmaxLoss(nn.Module):
     def __init__(self, init_temp=0.2):
         super().__init__()
-
-        # ✅ learnable temperature（用 log 更稳定）
         self.log_temp = nn.Parameter(torch.log(torch.tensor(init_temp)))
 
-    def forward(self, desc, var):
-        """
-        desc: [N, V, C]  (已 or 未 normalize 都可以，内部会 normalize)
-        var:  [N, V, 1]
-
-        return:
-            loss
-            conf: [N, V]
-        """
-
+    def forward(self, desc, var, use_var_weight=False):
         N, V, C = desc.shape
 
-        # ✅ normalize（非常重要）
         desc = F.normalize(desc, dim=2)
-
         temp = torch.exp(self.log_temp).clamp(0.01, 10.0)
 
         total_loss = 0.0
         total_pairs = 0
 
-        conf_accum = torch.zeros(N, V, device=desc.device)
+        correct_accum = torch.zeros(N, V, device=desc.device)
 
         for i in range(V):
             for j in range(i + 1, V):
 
-                Xi = desc[:, i, :]   # [N, C]
-                Xj = desc[:, j, :]   # [N, C]
+                Xi = desc[:, i, :]
+                Xj = desc[:, j, :]
 
-                var_i = var[:, i, 0]   # [N]
-                var_j = var[:, j, 0]   # [N]
-                
-                # clamp variance
-                var_i = torch.clamp(var_i, 1e-3, 1e2)
-                var_j = torch.clamp(var_j, 1e-3, 1e2)
-
-                # =========================
-                # similarity
-                # =========================
-                sim = (Xi @ Xj.t()) * temp   # [N, N]
+                sim = (Xi @ Xj.t()) * temp
 
                 log_p_ij = F.log_softmax(sim, dim=1)
                 log_p_ji = F.log_softmax(sim.t(), dim=1)
 
                 target = torch.arange(N, device=desc.device)
 
-                # =========================
-                # ✅ variance weighting
-                # =========================
-                # 每个点一个 weight
-                #weight = 1.0 / (var_i + var_j + 1e-6)   # [N]
-                #weight = weight / (weight.mean().detach() + 1e-6)
-                
-                weight = 1
+                loss_ij = F.nll_loss(log_p_ij, target, reduction='none')
+                loss_ji = F.nll_loss(log_p_ji, target, reduction='none')
 
-                loss_ij = F.nll_loss(log_p_ij, target, reduction='none')  # [N]
-                loss_ji = F.nll_loss(log_p_ji, target, reduction='none')  # [N]
+                # 🔥 可选 variance weighting（晚点再开）
+                if use_var_weight:
+                    var_i = var[:, i, 0].detach()
+                    var_j = var[:, j, 0].detach()
 
-                loss_ij = (loss_ij * weight).mean()
-                loss_ji = (loss_ji * weight).mean()
+                    weight = 1.0 / (1.0 + var_i + var_j)
+                    weight = torch.clamp(weight, min=0.2)
+
+                    loss_ij = loss_ij * weight
+                    loss_ji = loss_ji * weight
+
+                loss_ij = loss_ij.mean()
+                loss_ji = loss_ji.mean()
 
                 total_loss += (loss_ij + loss_ji)
                 total_pairs += 1
 
-                # =========================
-                # confidence（给 reliability 用）
-                # =========================
+                # ===== accuracy =====
                 with torch.no_grad():
-                    p_ij = torch.exp(log_p_ij)
-                    p_ji = torch.exp(log_p_ji)
+                    pred_ij = sim.argmax(dim=1)
+                    pred_ji = sim.argmax(dim=0)
 
-                    conf_i = p_ij.max(dim=1)[0]   # [N]
-                    conf_j = p_ji.max(dim=1)[0]
+                    gt = torch.arange(N, device=desc.device)
 
-                    conf_accum[:, i] += conf_i
-                    conf_accum[:, j] += conf_j
+                    correct_i = (pred_ij == gt).float()
+                    correct_j = (pred_ji == gt).float()
+
+                    correct_accum[:, i] += correct_i
+                    correct_accum[:, j] += correct_j
 
         loss = total_loss / total_pairs
-
-        conf = conf_accum / (V - 1)
+        conf = correct_accum / (V - 1)
 
         return loss, conf
 
@@ -232,22 +210,36 @@ class MultiViewVarianceLoss(nn.Module):
         var:  [N, V, 1]
         """
 
+        N, V, C = desc.shape
+
         desc = F.normalize(desc, dim=2)
-        
-        desc_detached = desc.detach()
-
-        # ===== multi-view mean =====
-        mu = desc_detached.mean(dim=1, keepdim=True)
-        error = ((desc_detached - mu) ** 2).sum(dim=2)
-
-        # ===== variance =====
         var = var.squeeze(-1)   # [N,V]
-        var = torch.clamp(var, 1e-3, 1e2)
 
-        # ===== loss =====
-        loss = error / var + torch.log(var)
+        total_loss = 0.0
+        total_pairs = 0
 
-        return loss.mean()
+        for i in range(V):
+            for j in range(i + 1, V):
+
+                # 🔥 detach descriptor（核心！！）
+                Xi = desc[:, i, :].detach()
+                Xj = desc[:, j, :].detach()
+
+                var_i = var[:, i]
+                var_j = var[:, j]
+
+                var_sum = var_i + var_j
+                var_sum = torch.clamp(var_sum, 0.1, 5.0)
+
+                # pairwise error
+                error = ((Xi - Xj) ** 2).sum(dim=1)
+
+                loss_ij = error / var_sum + torch.log(var_sum)
+
+                total_loss += loss_ij.mean()
+                total_pairs += 1
+
+        return total_loss / total_pairs
     
 class MultiViewReconstructionLoss(nn.Module):
     def __init__(self, device):
@@ -255,11 +247,6 @@ class MultiViewReconstructionLoss(nn.Module):
         self.device = device
 
     def forward(self, kpnet, desc_list, sf_list, T_list):
-        """
-        desc_list: list of [N, V, C]
-        sf_list: list of [N, V, C]
-        T_list: list of V torch tensors [4,4] (相对 pose)
-        """
         loss_total = 0.0
         count = 0
 
@@ -272,13 +259,52 @@ class MultiViewReconstructionLoss(nn.Module):
                 for j in range(V):
                     if i == j:
                         continue
-                    # i -> j
-                    # kpnet 重建 j 的 sf
-                    sf_recon = kpnet.reconstruction(desc[:,i,:], T_list[i], T_list[j])  # [N,C]
-                    sf_target = sf[:,j,:]  # [N,C]
 
-                    loss_total += F.mse_loss(sf_recon, sf_target)
-                    count += 1
+                    desc_i = F.normalize(desc[:, i, :], dim=1)  # [N,C]
+                    desc_j = F.normalize(desc[:, j, :], dim=1)  # [N,C]
+
+                    # =========================
+                    # 🔥 STEP 1: matching
+                    # =========================
+                    sim = desc_i @ desc_j.t()
+                    idx_ij = sim.argmax(dim=1)
+                    idx_ji = sim.argmax(dim=0)
+
+                    mutual = torch.arange(sim.shape[0], device=sim.device)
+                    mask = (idx_ji[idx_ij] == mutual)
+
+                    sf_j_matched = sf[:, j, :][idx_ij]
+
+                    # 只在 mutual matches 上计算 loss
+                    if mask.sum() > 0:
+                        # =========================
+                        # 🔥 STEP 2: reconstruction
+                        # =========================
+                        sf_recon = kpnet.reconstruction(
+                            desc[:, i, :],
+                            T_list[i],
+                            T_list[j]
+                        )  # [N,C]
+                        
+                        # =========================
+                        # 🔥 STEP 3: soft matching
+                        with torch.no_grad():
+                            # 计算 soft matching 权重
+                            sim = desc[:, i, :] @ desc[:, j, :].t()    # [N,N]
+                            prob = F.softmax(sim, dim=1)               # i -> j 概率分布
+
+                            # 软匹配 sf
+                            sf_j_soft = prob @ sf[:, j, :]             # [N,C]
+
+                        # =========================
+                        # 🔥 STEP 3: loss
+                        # =========================
+                        loss = F.mse_loss(sf_recon, sf_j_soft)
+                        loss_total += loss
+                        count += 1
+
+                    
+
 
         if count > 0:
             return loss_total / count
