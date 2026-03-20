@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.models as models
 from .utils import *
-
+from methods.Xfeat.xfeat import *
 
 # -------------------------
 # Shared Backbone
@@ -82,6 +82,7 @@ class SharedBackbone(nn.Module):
 
         return feat
 """
+"""
 class SharedBackbone(nn.Module):
 
     def __init__(self, out_dim=128, freeze=True):
@@ -113,6 +114,39 @@ class SharedBackbone(nn.Module):
         feat = self.proj(feat)    # [B,out_dim,H/4,W/4]
 
         return feat
+"""
+
+class SharedBackbone_XFeat(nn.Module):
+    def __init__(self, out_dim=128, freeze=True):
+        super().__init__()
+
+        # 初始化 XFeat
+        self.xfeat = XFeat()  # 如果有预训练权重可以加载
+        self.out_dim = out_dim
+
+        # XFeat 输出是 [B, 64, H/8, W/8]，proj + 上采样到 H/4, W/4
+        self.proj = nn.Sequential(
+            nn.Conv2d(64, out_dim, 1),
+            nn.GroupNorm(8, out_dim),
+            nn.ReLU(inplace=True)
+        )
+
+        # 是否冻结 XFeat backbone
+        if freeze:
+            for p in self.xfeat.parameters():
+                p.requires_grad = False
+
+    def forward(self, x):
+        # x: [B,3,H,W]
+
+        feat = self.xfeat.getFeatDesc(x)  # [B,64,H/8,W/8]
+
+        feat = self.proj(feat)               # [B,out_dim,H/8,W/8]
+        # 上采样到 H/4, W/4
+        feat = F.interpolate(feat, scale_factor=2, mode='bilinear', align_corners=False)
+
+        return feat
+
 
 # -------------------------
 # Descriptor Encoder
@@ -146,7 +180,7 @@ class DescriptorEncoder(nn.Module):
 # -------------------------
 
 class VarianceHead(nn.Module):
-    def __init__(self, feat_dim=128, epsilon=0.01):
+    def __init__(self, feat_dim=128, epsilon=0.1):
         super().__init__()
         self.epsilon = epsilon
 
@@ -285,7 +319,7 @@ class VarianceKPNetModel(nn.Module):
         super().__init__()
 
         # backbone
-        self.backbone = SharedBackbone(out_dim=feature_dim)
+        self.backbone = SharedBackbone_XFeat(out_dim=feature_dim)
 
         # descriptor branch
         self.descriptor_encoder = DescriptorEncoder(feature_dim, feature_dim)
