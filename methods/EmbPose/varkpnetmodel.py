@@ -152,62 +152,53 @@ class SharedBackbone_XFeat(nn.Module):
 # Descriptor Encoder
 # -------------------------
 
-class DescriptorEncoder(nn.Module):
-
-    def __init__(self, in_dim=128, desc_dim=128):
+class DualDescriptorHead(nn.Module):
+    def __init__(self, in_dim=128, dim=128):
         super().__init__()
 
-        self.net = nn.Sequential(
-            nn.Conv2d(in_dim, desc_dim, 3, padding=1),
-            nn.GroupNorm(8, desc_dim),
-            nn.ReLU(inplace=True),
+        # invariant branch（matching）
+        self.inv_head = nn.Sequential(
+            nn.Conv2d(in_dim, dim, 3, padding=1),
+            nn.GroupNorm(8, dim),
+            nn.ReLU(),
+            nn.Conv2d(dim, dim, 1)
+        )
 
-            nn.Conv2d(desc_dim, desc_dim, 3, padding=1),
-            nn.GroupNorm(8, desc_dim),
-            nn.ReLU(inplace=True),
-
-            nn.Conv2d(desc_dim, desc_dim, 1)
+        # variant branch（view sensitive）
+        self.var_head = nn.Sequential(
+            nn.Conv2d(in_dim, dim, 3, padding=1),
+            nn.GroupNorm(8, dim),
+            nn.ReLU(),
+            nn.Conv2d(dim, dim, 1)
         )
 
     def forward(self, x):
-        desc = self.net(x)
-        #desc = F.normalize(desc, dim=1)
-        return desc
+        f_inv = self.inv_head(x)
+        f_inv = F.normalize(f_inv, dim=1)
+
+        f_var = self.var_head(x)  # ❗不 normalize
+
+        return f_inv, f_var
 
 
 # -------------------------
 # Variance Head
 # -------------------------
 
-class VarianceHead(nn.Module):
-    def __init__(self, feat_dim=128, epsilon=0.1):
+class UncertaintyHead(nn.Module):
+    def __init__(self, in_dim=128):
         super().__init__()
-        self.epsilon = epsilon
 
         self.net = nn.Sequential(
-            # 第1层卷积 + GroupNorm + ReLU
-            nn.Conv2d(feat_dim, 256, 3, padding=1),
-            nn.GroupNorm(16, 256),
-            nn.ReLU(inplace=True),
-
-            # 第2层卷积 + GroupNorm + ReLU
-            nn.Conv2d(256, 128, 3, padding=1),
-            nn.GroupNorm(16, 128),
-            nn.ReLU(inplace=True),
-
-            # 第3层卷积 → 输出1通道
+            nn.Conv2d(in_dim, 128, 3, padding=1),
+            nn.ReLU(),
             nn.Conv2d(128, 1, 1)
         )
 
-    def forward(self, x):
-        """
-        x: [B, feat_dim, H, W]  (可以使用 normalize 前的 descriptor)
-        输出:
-            var_pred: [B, 1, H, W], >= epsilon
-        """
-        var_pred = self.net(x)
-        var_pred = F.softplus(var_pred) + self.epsilon  # 保证输出正数
-        return var_pred
+    def forward(self, feat):
+        log_sigma2 = self.net(feat)
+        sigma2 = F.softplus(log_sigma2) + 1e-4
+        return sigma2
 
 
 # -------------------------
@@ -318,95 +309,112 @@ class VarianceKPNetModel(nn.Module):
                  pose_embed=128):
         super().__init__()
 
-        # backbone
+        # -------------------------
+        # Backbone
+        # -------------------------
         self.backbone = SharedBackbone_XFeat(out_dim=feature_dim)
 
-        # descriptor branch
-        self.descriptor_encoder = DescriptorEncoder(feature_dim, feature_dim)
+        # -------------------------
+        # Descriptor (解耦)
+        # -------------------------
+        self.descriptor_encoder = DualDescriptorHead(feature_dim, feature_dim)
 
-        # heads
+        # -------------------------
+        # Heads（全部从 shared feature 出发）
+        # -------------------------
         self.reliability_head = ReliabilityHead(feature_dim)
-        self.variance_head = VarianceHead(feature_dim)
 
+        # 🔥 改：variance 从 shared_feat，不是 desc
+        self.uncertainty_head = UncertaintyHead(feature_dim)
 
-        # pose modules
+        # -------------------------
+        # Pose modules
+        # -------------------------
         self.pose_encoder = PoseEncoder(pose_dim, pose_embed)
 
+        # -------------------------
         # FiLM
+        # -------------------------
         self.film = FiLMModulation(pose_embed, feature_dim)
 
-        # decoder
+        # -------------------------
+        # Decoder（只作用在 var branch）
+        # -------------------------
         self.decoder = PointDecoder(feature_dim)
-        
-    
-    def reconstruction(self, desc_src, pose_src, pose_tgt):
-        """
-        desc_src: [N, C]
-        pose_src: [4,4] or [B,4,4]
-        pose_tgt: [4,4] or [B,4,4]
-        """
-        device = desc_src.device
 
-        # 确保 pose dtype 和 device
+    # =========================================================
+    # Reconstruction（只用 desc_var）
+    # =========================================================
+    def reconstruction(self, desc_var, pose_src, pose_tgt):
+
+        device = desc_var.device
+
         pose_src = pose_src.to(device).float()
         pose_tgt = pose_tgt.to(device).float()
 
-        # 处理单张 pose
         if pose_src.dim() == 2:
             pose_src = pose_src.unsqueeze(0)
         if pose_tgt.dim() == 2:
             pose_tgt = pose_tgt.unsqueeze(0)
 
         # relative pose
-        pose_ij = pose_matrix_to_9d(pose_src, pose_tgt)  # [B,9]
-        pose_ij = pose_ij.to(device).float()
+        pose_ij = pose_matrix_to_9d(pose_src, pose_tgt)
 
-        # pose embedding
-        pose_embed = self.pose_encoder(pose_ij)  # [B,D]
+        pose_embed = self.pose_encoder(pose_ij)
 
-        # ---- 核心修改 ----
         if pose_embed.dim() == 1:
-            pose_embed = pose_embed.unsqueeze(0)  # [1,D]
+            pose_embed = pose_embed.unsqueeze(0)
 
-        # 如果 pose_embed batch >1, 取平均
         if pose_embed.shape[0] > 1:
-            pose_embed = pose_embed.mean(dim=0, keepdim=True)  # [1,D]
+            pose_embed = pose_embed.mean(dim=0, keepdim=True)
 
-        # 广播到关键点数
-        N = desc_src.shape[0]
-        pose_embed = pose_embed.expand(N, -1)  # [N,D]
+        # broadcast
+        N = desc_var.shape[0]
+        pose_embed = pose_embed.expand(N, -1)
 
-        # FiLM modulation
-        latent = desc_src + self.film(desc_src, pose_embed)
+        # 🔥 只作用在 var branch
+        latent = desc_var + self.film(desc_var, pose_embed)
+
         pred_desc = self.decoder(latent)
         pred_desc = F.normalize(pred_desc, dim=1)
 
         return pred_desc
-        
-    
+
+    # =========================================================
+    # Forward
+    # =========================================================
     def forward(self, img):
-        """
-        img: [B,3,H,W]
-        pose:  [B,pose_dim]
-        coords: [B,N,2] integer coordinates (y,x)
-        """
 
+        # -------------------------
         # 1. shared feature
-        shared_featmap = self.backbone(img)        # [B, feat_dim, H, W]
-        
-        # 2. descriptor map (full map)
-        desc_map = self.descriptor_encoder(shared_featmap)  # [B,feat_dim,H,W]
-        
-        # 2. variance map (full map)
-        variance_map = self.variance_head(desc_map)  # [B,1,H,W]
-        #desc_map = F.normalize(desc_map, dim=1)
+        # -------------------------
+        shared_featmap = self.backbone(img)  # [B,C,H,W]
 
-        
-        # 5. reliability map from descriptor
-        reliability_map = self.reliability_head(desc_map)  # [B,1,H,W]
+        # -------------------------
+        # 2. descriptor（解耦）
+        # -------------------------
+        desc_inv, desc_var = self.descriptor_encoder(shared_featmap)
 
-        return shared_featmap, variance_map, desc_map, reliability_map
-        
+        # -------------------------
+        # 3. uncertainty（🔥关键改动）
+        # -------------------------
+        variance_map = self.uncertainty_head(shared_featmap)
+
+        # -------------------------
+        # 4. reliability（🔥建议也用 shared_feat）
+        # -------------------------
+        reliability_map = self.reliability_head(shared_featmap)
+
+        # -------------------------
+        # 输出（全部返回）
+        # -------------------------
+        return {
+            "shared_feat": shared_featmap,
+            "desc_inv": desc_inv,
+            "desc_var": desc_var,
+            "variance": variance_map,
+            "reliability": reliability_map
+        }
 
 
 

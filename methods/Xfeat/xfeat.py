@@ -96,8 +96,7 @@ class XFeat(nn.Module):
                     'descriptors': feats[b][valid[b]]} for b in range(B) 
                ]
 
-    @torch.inference_mode
-    def getFeatDesc(self, x):
+    def getFeatDesc(self, x, freeze_xfeat=True):
         """
             Compute sparse keypoints & descriptors. Supports batched mode.
 
@@ -109,7 +108,12 @@ class XFeat(nn.Module):
         """
         x, _, _ = self.preprocess_tensor(x)
         _, _, _H1, _W1 = x.shape
-        M1, _, _ = self.net(x)
+        if freeze_xfeat:
+            with torch.no_grad():
+                M1, _, _ = self.net(x)
+        else:
+            M1, _, _ = self.net(x)
+            
         M1 = F.normalize(M1, dim=1)
         
         return M1

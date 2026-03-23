@@ -33,8 +33,8 @@ class MegaDepthDataset(Dataset):
                  root_dir,
                  npz_path,
                  mode='train',
-                 min_overlap_score = 0.1, #0.3,
-                 max_overlap_score = 0.7, #1,
+                 min_overlap_score = 0.3, #0.3,
+                 max_overlap_score = 0.8, #1,
                  load_depth = True,
                  img_resize = (800,608), #or None
                  df=32,
