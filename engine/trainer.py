@@ -306,7 +306,8 @@ class TrainerMultiView:
             # =========================
             # compute losses
             # =========================
-            loss_desc_total, loss_var_total, loss_rel_total, loss_recon_total = 0.0, 0.0, 0.0, 0.0
+            loss_desc_total, loss_var_total, loss_rel_total, loss_recon_total, loss_ortho_total = 0.0, 0.0, 0.0, 0.0, 0.0
+            loss_equiv_total = 0.0
             valid_batch = 0
 
             for b in range(len(desc_list)):
@@ -318,12 +319,26 @@ class TrainerMultiView:
     
                 if desc.shape[0] == 0:
                     continue
+                
+                # Orthogonality loss
+                loss_ortho_b = 0.0
+                count = 0
+                N, V, C = desc.shape
+
+                for v in range(V):
+                    f_inv_v = desc[:, v, :]        # [N,C]
+                    f_var_v = desc_var_b[:, v, :]  # [N,C]
+
+                    loss_ortho_b += orthogonality_loss(f_inv_v, f_var_v)
+                    count += 1
+
+                loss_ortho_b = loss_ortho_b / count         
 
                 # descriptor loss (memory-efficient Mahalanobis)
                 loss_desc_b, conf = self.desc_loss_fn(desc, var)
 
                 # variance loss
-                loss_var_b = self.var_loss_fn(desc_var_b, var)
+                loss_var_b = self.var_loss_fn(desc, var)
 
                 # reliability loss
                 rel_pred = rel.squeeze(-1)
@@ -334,16 +349,23 @@ class TrainerMultiView:
                 T_list = [T.to(self.device, dtype=torch.float) for T in batch_data['T']]
                 loss_recon_b = self.recon_loss_fn(
                     self.kpnet,
-                    desc_var_b,      # 保持 [N,V,C]
-                    sf_b,      # [N,V,C]
-                    T_list
-                    )
+                    desc,          # 🔥 invariant descriptor
+                    desc_var_b,    # 🔥 variant descriptor
+                    sf_b,
+                    T_list, 
+                    iter_idx
+                )
+                
+                # equivariance loss 
+                loss_equiv_b = equivariance_loss(self.kpnet, desc_var_b, T_list)
 
                 # accumulate
                 loss_desc_total += loss_desc_b
                 loss_var_total  += loss_var_b
                 loss_rel_total  += loss_rel_b
                 loss_recon_total += loss_recon_b
+                loss_ortho_total += loss_ortho_b
+                loss_equiv_total += loss_equiv_b
                 valid_batch += 1
 
             # normalize
@@ -352,25 +374,34 @@ class TrainerMultiView:
                 loss_var  = loss_var_total / valid_batch
                 loss_rel  = loss_rel_total / valid_batch
                 loss_recon = loss_recon_total / valid_batch
+                loss_ortho = loss_ortho_total / valid_batch
+                loss_equiv = loss_equiv_total / valid_batch
             else:
                 dummy = 0.0 * next(self.kpnet.parameters()).sum()
                 loss_desc = loss_var = loss_rel = loss_recon = dummy
 
             # final weighted loss schedule
-            if iter_idx < 1200:
-                loss = loss_desc
-            elif iter_idx < 1800:
-                loss = loss_desc + 0.1 * loss_rel
-            elif iter_idx < 2500:
-                loss = loss_desc + 0.1 * loss_rel + 0.15 * loss_var
-            else:
-                loss = loss_desc + 0.08 * loss_rel + 0.15 * loss_var + 0.15 * loss_recon
+            if iter_idx < 1500:
+                loss = loss_desc + 0.05 * loss_ortho
 
-            # 🔥 anti-collapse term
-            desc_flat = torch.cat([d.reshape(-1, d.shape[-1]) for d in desc_list], dim=0)
-            std = desc_flat.std(dim=0)
-            loss_std = torch.mean(F.relu(0.5 - std))
-            loss += 0.05 * loss_std
+            elif iter_idx < 4000:
+                loss = (
+                    loss_desc +
+                    0.1 * loss_recon +
+                    0.05 * loss_ortho +
+                    0.1 * loss_equiv_b
+                )
+
+            else:
+                loss = (
+                    loss_desc +
+                    0.1 * loss_recon +
+                    0.1 * loss_var +
+                    0.05 * loss_rel +
+                    0.05 * loss_ortho +
+                    0.1 * loss_equiv_b
+                )
+
 
             # backward
             loss.backward()

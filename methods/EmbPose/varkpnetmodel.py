@@ -153,10 +153,10 @@ class SharedBackbone_XFeat(nn.Module):
 # -------------------------
 
 class DualDescriptorHead(nn.Module):
-    def __init__(self, in_dim=128, dim=128):
+    def __init__(self, in_dim=128, dim=128, bottleneck=32):
         super().__init__()
 
-        # invariant branch（matching）
+        # invariant（高容量）
         self.inv_head = nn.Sequential(
             nn.Conv2d(in_dim, dim, 3, padding=1),
             nn.GroupNorm(8, dim),
@@ -164,20 +164,16 @@ class DualDescriptorHead(nn.Module):
             nn.Conv2d(dim, dim, 1)
         )
 
-        # variant branch（view sensitive）
+        # 🔥 variant（低容量 bottleneck）
         self.var_head = nn.Sequential(
-            nn.Conv2d(in_dim, dim, 3, padding=1),
-            nn.GroupNorm(8, dim),
+            nn.Conv2d(in_dim, bottleneck, 3, padding=1),
             nn.ReLU(),
-            nn.Conv2d(dim, dim, 1)
+            nn.Conv2d(bottleneck, dim, 1)
         )
 
     def forward(self, x):
-        f_inv = self.inv_head(x)
-        f_inv = F.normalize(f_inv, dim=1)
-
-        f_var = self.var_head(x)  # ❗不 normalize
-
+        f_inv = F.normalize(self.inv_head(x), dim=1)
+        f_var = self.var_head(x)
         return f_inv, f_var
 
 
@@ -278,20 +274,16 @@ class FiLMModulation(nn.Module):
 # Simple per-point decoder
 # -------------------------
 class PointDecoder(nn.Module):
-
     def __init__(self, feat_dim=64):
         super().__init__()
 
         self.net = nn.Sequential(
-
             nn.Linear(feat_dim, feat_dim),
             nn.ReLU(inplace=True),
-
             nn.Linear(feat_dim, feat_dim)
         )
 
     def forward(self, x):
-
         return self.net(x)
 
 
@@ -345,7 +337,11 @@ class VarianceKPNetModel(nn.Module):
     # =========================================================
     # Reconstruction（只用 desc_var）
     # =========================================================
-    def reconstruction(self, desc_var, pose_src, pose_tgt):
+    def reconstruction(self, desc_var, desc_inv, pose_src, pose_tgt, use_inv=False):
+        """
+        desc_var: [N,C]
+        desc_inv: [N,C]
+        """
 
         device = desc_var.device
 
@@ -357,9 +353,7 @@ class VarianceKPNetModel(nn.Module):
         if pose_tgt.dim() == 2:
             pose_tgt = pose_tgt.unsqueeze(0)
 
-        # relative pose
         pose_ij = pose_matrix_to_9d(pose_src, pose_tgt)
-
         pose_embed = self.pose_encoder(pose_ij)
 
         if pose_embed.dim() == 1:
@@ -368,18 +362,34 @@ class VarianceKPNetModel(nn.Module):
         if pose_embed.shape[0] > 1:
             pose_embed = pose_embed.mean(dim=0, keepdim=True)
 
-        # broadcast
         N = desc_var.shape[0]
         pose_embed = pose_embed.expand(N, -1)
 
-        # 🔥 只作用在 var branch
-        latent = desc_var + self.film(desc_var, pose_embed)
+        # -------------------------
+        # ✅ 不再 detach！！
+        # -------------------------
+        latent = desc_var
 
+        # -------------------------
+        # FiLM modulation
+        # -------------------------
+        delta = self.film(latent, pose_embed)
+        latent = latent + delta
+
+        # -------------------------
+        # ❗阶段控制（避免 shortcut）
+        # -------------------------
+        if use_inv:
+            latent = latent + desc_inv
+
+        # -------------------------
+        # decode
+        # -------------------------
         pred_desc = self.decoder(latent)
         pred_desc = F.normalize(pred_desc, dim=1)
 
         return pred_desc
-
+    
     # =========================================================
     # Forward
     # =========================================================

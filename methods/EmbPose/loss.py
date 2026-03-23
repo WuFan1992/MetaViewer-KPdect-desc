@@ -171,10 +171,10 @@ class MahalanobisDualSoftmaxLoss(nn.Module):
                 dist = fi2 + fj2.t() - 2 * (fi @ fj.t())    # [N,N]
 
                 # Mahalanobis normalization
-                sigma_ij = si[:, None] + sj[None, :]        # [N,N]
-                sigma_ij = sigma_ij.detach().clamp(min=0.05, max=2.0) + 1e-6
+                sigma_ij = (si[:, None] + sj[None, :]).detach().clamp(0.05, 2.0)
 
-                dist = dist / sigma_ij
+                weight = torch.exp(-sigma_ij)
+                dist = dist * weight
 
                 # similarity for dual-softmax
                 sim = -dist * temp
@@ -219,17 +219,17 @@ class MultiViewReconstructionLoss(nn.Module):
         super().__init__()
         self.device = device
 
-    def forward(self, kpnet, desc, sf, T_list):
+    def forward(self, kpnet, desc, desc_var, sf, T_list, iter_idx):
         """
-        desc: [N,V,C]   descriptor per view
-        sf:   [N,V,C]   shared features per view
-        T_list: list of V [4,4] transformation matrices
+        desc:     [N,V,C] invariant descriptor
+        desc_var: [N,V,C] variant descriptor
+        sf:       [N,V,C] shared features (target)
         """
+
         N, V, C = desc.shape
         loss_total = 0.0
         count = 0
 
-        # 归一化 descriptor
         desc_norm = F.normalize(desc, dim=2)
 
         for i in range(V):
@@ -237,46 +237,47 @@ class MultiViewReconstructionLoss(nn.Module):
                 if i == j:
                     continue
 
-                desc_i = desc_norm[:, i, :]  # [N,C]
-                desc_j = desc_norm[:, j, :]  # [N,C]
+                # -------------------------
+                # descriptors
+                # -------------------------
+                desc_i = desc_norm[:, i, :]   # [N,C]
+                desc_j = desc_norm[:, j, :]   # [N,C]
 
-                # =========================
-                # STEP 1: mutual nearest neighbor matching
-                # =========================
-                sim = desc_i @ desc_j.t()          # [N,N]
-                idx_ij = sim.argmax(dim=1)
-                idx_ji = sim.argmax(dim=0)
-                mutual_mask = (idx_ji[idx_ij] == torch.arange(N, device=sim.device))
+                desc_inv_i = desc[:, i, :]       # [N,C]
+                desc_var_i = desc_var[:, i, :]   # [N,C]
 
-                if mutual_mask.sum() == 0:
-                    continue
+                # -------------------------
+                # 🔥 reconstruction（新结构）
+                # -------------------------
+                use_inv = iter_idx > 3000
 
-                # =========================
-                # STEP 2: reconstruction
-                # =========================
                 sf_recon = kpnet.reconstruction(
-                    desc_i,
+                    desc_var_i,
+                    desc_inv_i,
                     T_list[i],
-                    T_list[j]
-                )  # [N,C]
+                    T_list[j],
+                    use_inv=use_inv
+                )
 
-                # =========================
-                # STEP 3: soft matching
+                # -------------------------
+                # 🔥 soft correspondence（替代 MNN）
+                # -------------------------
                 with torch.no_grad():
-                    prob = F.softmax(desc_i @ desc_j.t(), dim=1)  # [N,N]
-                    sf_j_soft = prob @ sf[:, j, :]                # [N,C]
+                    sim = desc_i @ desc_j.t()          # [N,N]
+                    prob = F.softmax(sim, dim=1)       # soft match
+                    sf_j_soft = prob @ sf[:, j, :]     # [N,C]
 
-                # =========================
-                # STEP 4: MSE loss on mutual matches
-                mask_idx = mutual_mask.nonzero(as_tuple=True)[0]  # [M]
-                loss = F.mse_loss(sf_recon[mask_idx], sf_j_soft[mask_idx])
+                # -------------------------
+                # 🔥 全点监督（不再用 mask）
+                # -------------------------
+                loss = F.mse_loss(sf_recon, sf_j_soft)
+
                 loss_total += loss
                 count += 1
 
         if count > 0:
             return loss_total / count
         else:
-            # 保持梯度，避免 None
             return 0.0 * desc.sum()
         
 class ReliabilityLoss(nn.Module):
@@ -296,43 +297,76 @@ class ReliabilityLoss(nn.Module):
         return F.binary_cross_entropy(rel_pred, conf.detach())
 
 class FeatureVarianceLoss(nn.Module):
-    def __init__(self, eps=1e-6):
+    def __init__(self):
         super().__init__()
-        self.eps = eps
 
-    def forward(self, desc_var, var_pred):
+    def forward(self, desc_inv, var_pred):
         """
-        desc_var: [N,V,C]
+        desc_inv: [N,V,C]
         var_pred: [N,V,1]
         """
 
-        N, V, C = desc_var.shape
+        N, V, C = desc_inv.shape
 
-        # -------------------------
-        # GT from feature variation（🔥核心）
-        # -------------------------
-        with torch.no_grad():
-            desc_norm = F.normalize(desc_var, dim=2)
+        var_gt = 0.0
+        count = 0
 
-            var_gt = 0.0
-            count = 0
-            for i in range(V):
-                for j in range(i+1, V):
-                    diff = desc_norm[:, i, :] - desc_norm[:, j, :]
-                    var_gt += (diff ** 2).sum(dim=1)
-                    count += 1
+        desc_norm = F.normalize(desc_inv, dim=2)
 
-            var_gt = var_gt / count
-            var_gt = torch.clamp(var_gt, min=0.05)  # 🔥防 collapse
+        for i in range(V):
+            for j in range(i + 1, V):
 
-        # -------------------------
-        # prediction
-        # -------------------------
-        var_pred = var_pred.squeeze(-1).mean(dim=1) + self.eps
+                sim = desc_norm[:, i, :] @ desc_norm[:, j, :].t()
+                prob = F.softmax(sim, dim=1)
 
-        # -------------------------
-        # log loss（更稳定）
-        # -------------------------
-        loss = F.l1_loss(torch.log(var_pred), torch.log(var_gt))
+                entropy = -torch.sum(prob * torch.log(prob + 1e-6), dim=1)
+
+                var_gt += entropy
+                count += 1
+
+        var_gt = var_gt / count
+        var_gt = var_gt.detach()
+
+        var_pred = var_pred.squeeze(-1).mean(dim=1)
+
+        loss = F.l1_loss(var_pred, var_gt)
 
         return loss
+    
+def orthogonality_loss(f_inv, f_var):
+    """
+    f_inv: [N,C]
+    f_var: [N,C]
+    """
+    f_inv = F.normalize(f_inv, dim=1)
+    f_var = F.normalize(f_var, dim=1)
+
+    dot = torch.sum(f_inv * f_var, dim=1)  # [N]
+    return torch.mean(dot ** 2)
+
+def equivariance_loss(kpnet, desc_var, T_list):
+    """
+    desc_var: [N,V,C]
+    """
+    N, V, C = desc_var.shape
+
+    loss = 0.0
+    count = 0
+
+    for i in range(V):
+        for j in range(V):
+            if i == j:
+                continue
+
+            pred_j = kpnet.reconstruction(
+                desc_var[:, i, :],
+                torch.zeros_like(desc_var[:, i, :]),
+                T_list[i],
+                T_list[j],
+                use_inv=False
+            )
+
+            loss += F.mse_loss(pred_j, desc_var[:, j, :].detach())
+            count += 1
+
+    return loss / count
