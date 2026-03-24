@@ -13,7 +13,7 @@ from modules.megadepth.megadepth_wraper import *
 from modules.sfm_loader import *
 from modules.utils import *
 
-from methods.EmbPose.varkpnetmodel import VarianceKPNetModel
+from methods.EmbPose.varkpnetmodel import VUDNet
 
 from methods.EmbPose.loss import *
 
@@ -174,21 +174,13 @@ class TrainerMultiView:
         
         
         self.data_loader = torch.utils.data.DataLoader(
-            self.dataset, batch_size=1, shuffle=True
+            self.dataset, batch_size=2, shuffle=True
         )
         self.optimizer = torch.optim.Adam(
             filter(lambda x: x.requires_grad, self.kpnet.parameters()), lr=3e-4
         )
         self.scheduler = torch.optim.lr_scheduler.StepLR(self.optimizer, step_size=30000, gamma=0.5)
         
-        # ------------------------------
-        # Loss functions
-        # ------------------------------
-        self.desc_loss_fn = MahalanobisDualSoftmaxLoss()
-        self.recon_loss_fn = MultiViewReconstructionLoss(self.device)
-        self.var_loss_fn = FeatureVarianceLoss()
-        self.rel_loss_fn = ReliabilityLoss()
-
         
         
         self.num_iters = num_iters
@@ -241,17 +233,18 @@ class TrainerMultiView:
                
             
              # ===== forward each view =====
-            shared_feats, desc_inv_maps, desc_var_maps, variance_maps, reliability_maps = [], [], [], [], []
+            shared_feats, f_inv_maps, f_geo_maps, f_app_maps, sigma_maps, reliability_maps = [], [], [], [], [], []
             for v in range(V):
                 out = self.kpnet(images[v].to(self.device))
-                shared_feats.append(out["shared_feat"])
-                desc_inv_maps.append(out["desc_inv"])
-                desc_var_maps.append(out["desc_var"])
-                variance_maps.append(out["variance"])
+                shared_feats.append(out["shared"])
+                f_inv_maps.append(out["f_inv"])
+                f_geo_maps.append(out["f_geo"])
+                f_app_maps.append(out["f_app"])
+                sigma_maps.append(out["sigma"])
                 reliability_maps.append(out["reliability"])
 
             # ===== sample multi-view features =====
-            desc_list, var_list, rel_list, sf_list, desc_var_list = [], [], [], [], []
+            f_inv_list, f_geo_list, f_app_list, rel_list, sf_list, sigma_list = [], [], [], [], [],[]
 
             for b in range(B):
                 corrs = multi_corrs[b]  # [N,V,2]
@@ -268,139 +261,138 @@ class TrainerMultiView:
                     idx = torch.arange(N)
 
 
-                desc_per_point, var_per_point, rel_per_point, sf_per_point, desc_var_per_point= [], [], [], [], []
+                f_inv_per_point, f_geo_per_point, rel_per_point, sf_per_point, f_app_per_point, sigma_per_point = [], [], [], [], [],[]
 
                 for v in range(V):
                     coords = corrs[:, v, :].to(self.device)
 
-                    desc_inv_sample = sample_map_at_coords(desc_inv_maps[v][b:b+1], coords, H_orig, W_orig)
-                    desc_var_sample = sample_map_at_coords(desc_var_maps[v][b:b+1], coords, H_orig, W_orig)
-                    var_sample      = sample_map_at_coords(variance_maps[v][b:b+1], coords, H_orig, W_orig)
+                    f_inv_sample = sample_map_at_coords(f_inv_maps[v][b:b+1], coords, H_orig, W_orig)
+                    f_geo_sample = sample_map_at_coords(f_geo_maps[v][b:b+1], coords, H_orig, W_orig)
+                    f_app_sample = sample_map_at_coords(f_app_maps[v][b:b+1], coords, H_orig, W_orig)
+                    sigma_sample = sample_map_at_coords(sigma_maps[v][b:b+1], coords, H_orig, W_orig)
                     rel_sample      = sample_map_at_coords(reliability_maps[v][b:b+1], coords, H_orig, W_orig)
                     sf_sample       = sample_map_at_coords(shared_feats[v][b:b+1], coords, H_orig, W_orig)
 
-                    desc_per_point.append(desc_inv_sample)
-                    var_per_point.append(var_sample)
-                    rel_per_point.append(rel_sample)
+                    f_inv_per_point.append(f_inv_sample)
+                    f_geo_per_point.append(f_geo_sample)
+                    f_app_per_point.append(f_app_sample)
+                    sigma_per_point.append(sigma_sample)
                     sf_per_point.append(sf_sample)
-                    desc_var_per_point.append(desc_var_sample)
+                    rel_per_point.append(rel_sample)
+                    
 
 
                 # stack
-                desc_per_point = torch.stack(desc_per_point, dim=1)
-                var_per_point  = torch.stack(var_per_point, dim=1)
+                f_inv = torch.stack(f_inv_per_point, dim=1)   # [N,V,C]
+                f_geo = torch.stack(f_geo_per_point, dim=1)
+                f_app = torch.stack(f_app_per_point, dim=1)
+                sigma = torch.stack(sigma_per_point, dim=1)
+                shared = torch.stack(sf_per_point, dim=1)
                 rel_per_point  = torch.stack(rel_per_point, dim=1)
-                sf_per_point   = torch.stack(sf_per_point, dim=1)
-                desc_var_per_point = torch.stack(desc_var_per_point, dim=1)
-
-                desc_list.append(desc_per_point)
-                var_list.append(var_per_point)
+                
+                f_inv_list.append(f_inv)
+                f_geo_list.append(f_geo)
+                f_app_list.append(f_app)
                 rel_list.append(rel_per_point)
-                sf_list.append(sf_per_point)
-                desc_var_list.append(desc_var_per_point)
+                sf_list.append(shared)
+                sigma_list.append(sigma)
 
-            if len(desc_list) == 0:
+
+            if len(f_inv_list) == 0:
                 print("⚠️ Skip iteration due to too few correspondences")
                 continue
 
             # =========================
             # compute losses
             # =========================
-            loss_desc_total, loss_var_total, loss_rel_total, loss_recon_total, loss_ortho_total = 0.0, 0.0, 0.0, 0.0, 0.0
-            loss_equiv_total = 0.0
+            loss_desc_total = 0.0
+            loss_prob_total = 0.0
+            loss_ortho_total = 0.0
+            loss_geo_total = 0.0
+            loss_recon_total = 0.0
+            loss_cross_total = 0.0
+            loss_rel_total = 0.0
             valid_batch = 0
 
-            for b in range(len(desc_list)):
-                desc  = desc_list[b]         # [N,V,C]
-                var   = var_list[b]          # [N,V,1]
-                rel   = rel_list[b]          # [N,V,1]
-                desc_var_b = desc_var_list[b]  # [N,V,C]
-                sf_b       = sf_list[b]       # [N,V,C]
+            for b in range(len(f_inv_list)):
+                f_inv = f_inv_list[b]
+                f_geo = f_geo_list[b]
+                f_app = f_app_list[b]
+                sigma = sigma_list[b]
+                rel_pred   = rel_list[b]          # [N,V,1]
+                shared       = sf_list[b]       # [N,V,C]
+
     
-                if desc.shape[0] == 0:
+                if f_inv.shape[0] == 0:
                     continue
                 
-                # Orthogonality loss
-                loss_ortho_b = 0.0
-                count = 0
-                N, V, C = desc.shape
+                # descriptor loss
+                loss_desc_b = dual_softmax_loss(f_inv)
 
-                for v in range(V):
-                    f_inv_v = desc[:, v, :]        # [N,C]
-                    f_var_v = desc_var_b[:, v, :]  # [N,C]
+                # probabilistic loss
+                loss_prob_b = probabilistic_loss(f_inv, sigma)
 
-                    loss_ortho_b += orthogonality_loss(f_inv_v, f_var_v)
-                    count += 1
+                # orthogonality
+                loss_ortho_geo = orthogonality_loss(f_inv, f_geo)
+                loss_ortho_app = orthogonality_loss(f_inv, f_app)
+                loss_ortho_total_b = 0.5 * (loss_ortho_geo + loss_ortho_app)
+                
 
-                loss_ortho_b = loss_ortho_b / count         
-
-                # descriptor loss (memory-efficient Mahalanobis)
-                loss_desc_b, conf = self.desc_loss_fn(desc, var)
-
-                # variance loss
-                loss_var_b = self.var_loss_fn(desc, var)
-
-                # reliability loss
-                rel_pred = rel.squeeze(-1)
-                conf = conf.clamp(0.01, 0.99)
-                loss_rel_b = F.binary_cross_entropy(rel_pred, conf.detach())
-
-                # reconstruction loss ✅ 保持 desc_var_list[b] 的 [N,V,C] 维度
+                # geometry loss
                 T_list = [T.to(self.device, dtype=torch.float) for T in batch_data['T']]
-                loss_recon_b = self.recon_loss_fn(
-                    self.kpnet,
-                    desc,          # 🔥 invariant descriptor
-                    desc_var_b,    # 🔥 variant descriptor
-                    sf_b,
-                    T_list, 
-                    iter_idx
+                loss_geo_b = geo_loss(self.kpnet, f_geo, T_list, batch_idx=b)
+
+                # reconstruction loss
+                loss_recon_b = recon_loss(self.kpnet, f_inv, f_geo, f_app, shared)
+
+                # cross-view
+                loss_cross_b = cross_view_loss(
+                        self.kpnet, f_inv, f_geo, f_app, shared, T_list, batch_idx=b
                 )
                 
-                # equivariance loss 
-                loss_equiv_b = equivariance_loss(self.kpnet, desc_var_b, T_list)
+                # reliability loss
+                loss_rel_b = reliability_loss(rel_pred, f_inv)
 
                 # accumulate
                 loss_desc_total += loss_desc_b
-                loss_var_total  += loss_var_b
-                loss_rel_total  += loss_rel_b
+                loss_prob_total += loss_prob_b
+                loss_ortho_total += loss_ortho_total_b
+                loss_geo_total += loss_geo_b
                 loss_recon_total += loss_recon_b
-                loss_ortho_total += loss_ortho_b
-                loss_equiv_total += loss_equiv_b
+                loss_cross_total += loss_cross_b
+                loss_rel_total += loss_rel_b
                 valid_batch += 1
 
             # normalize
             if valid_batch > 0:
                 loss_desc = loss_desc_total / valid_batch
-                loss_var  = loss_var_total / valid_batch
-                loss_rel  = loss_rel_total / valid_batch
-                loss_recon = loss_recon_total / valid_batch
+                loss_prob = loss_prob_total / valid_batch
                 loss_ortho = loss_ortho_total / valid_batch
-                loss_equiv = loss_equiv_total / valid_batch
+                loss_geo = loss_geo_total / valid_batch
+                loss_recon = loss_recon_total / valid_batch
+                loss_cross = loss_cross_total / valid_batch
+                loss_rel  = loss_rel_total / valid_batch
+                
             else:
                 dummy = 0.0 * next(self.kpnet.parameters()).sum()
-                loss_desc = loss_var = loss_rel = loss_recon = dummy
+                loss_desc = loss_prob = loss_ortho = loss_geo = loss_recon = loss_cross = loss_rel = dummy
 
-            # final weighted loss schedule
-            if iter_idx < 1500:
-                loss = loss_desc + 0.05 * loss_ortho
+            # -------------------------
+            # final weighted loss (smooth schedule)
+            # -------------------------
+            w_geo = torch.sigmoid(torch.tensor((iter_idx - 2000)/500, device=self.device))
+            w_rec = torch.sigmoid(torch.tensor((iter_idx - 3000)/500, device=self.device))
+            w_cross = torch.sigmoid(torch.tensor((iter_idx - 3500)/500, device=self.device))
 
-            elif iter_idx < 4000:
-                loss = (
-                    loss_desc +
-                    0.1 * loss_recon +
-                    0.05 * loss_ortho +
-                    0.1 * loss_equiv_b
-                )
-
-            else:
-                loss = (
-                    loss_desc +
-                    0.1 * loss_recon +
-                    0.1 * loss_var +
-                    0.05 * loss_rel +
-                    0.05 * loss_ortho +
-                    0.1 * loss_equiv_b
-                )
+            loss = (
+                loss_desc +
+                0.1 * loss_prob +
+                0.1 * w_geo * loss_geo +
+                0.1 * w_rec * loss_recon +
+                0.1 * w_cross * loss_cross +
+                0.05 * loss_ortho +
+                0.05 * loss_rel
+            )
 
 
             # backward
@@ -411,22 +403,35 @@ class TrainerMultiView:
             self.scheduler.step()
 
             self.progress_bar.set_description(
-                f"[Iter {iter_idx}] loss:{loss.item():.4f} var:{loss_var.item():.4f} ds:{loss_desc.item():.4f} "
-                f"kp:{loss_rel.item():.4f} rec:{loss_recon.item():.4f}"
-            )
-
+                f"[Iter {iter_idx}] "
+                f"loss:{loss.item():.4f} "
+                f"desc:{loss_desc.item():.4f} "
+                f"prob:{loss_desc_total.item():.4f} "       # dual-softmax probability loss
+                f"geo:{loss_recon_total.item():.4f} "       # geometric / variant descriptor reconstruction
+                f"rec:{loss_recon.item():.4f} "             # reconstruction loss
+                f"cross:{loss_cross.item():.4f} "             # feature variance / cross-view
+                f"ortho:{loss_ortho.item():.4f} "           # orthogonality loss
+                f"rel:{loss_rel.item():.4f}"                # reliability BCE
+            )       
+            
             # 10. 定期保存 checkpoint
             if (iter_idx+1) % 1000 == 0 and self.cpkt_save_path is not None:
                 torch.save(self.kpnet.state_dict(), f"{self.cpkt_save_path}/kpnet_iter_{iter_idx}.pth")
             
             self.progress_bar.update(1)
             
-            # Log metrics
+            # -------------------------
+            # Log metrics to TensorBoard
+            # -------------------------
             self.writer.add_scalar('Loss/total', loss.item(), iter_idx)
-            self.writer.add_scalar('Loss/description', loss_desc.item(), iter_idx)
-            self.writer.add_scalar('Loss/recontruction', loss_recon.item(), iter_idx)
-            self.writer.add_scalar('Loss/reliability', loss_rel.item(), iter_idx)
-            self.writer.add_scalar('Loss/variance', loss_var.item(), iter_idx)
+            self.writer.add_scalar('Loss/description', loss_desc.item(), iter_idx)   # descriptor Mahalanobis
+            self.writer.add_scalar('Loss/reconstruction', loss_recon.item(), iter_idx) # reconstruction loss (variant->shared)
+            self.writer.add_scalar('Loss/reliability', loss_rel.item(), iter_idx)    # reliability BCE
+            self.writer.add_scalar('Loss/variance',loss_cross.item(), iter_idx)       # feature variance loss
+            self.writer.add_scalar('Loss/orthogonality', loss_ortho.item(), iter_idx) # orthogonality between inv/var
+            self.writer.add_scalar('Loss/prob', loss_desc_total.item(), iter_idx)     # dual-softmax probability loss
+            self.writer.add_scalar('Loss/geo', loss_recon_total.item(), iter_idx)     # geometric / variant descriptor reconstruction
+
 
 
 
@@ -449,10 +454,19 @@ if __name__ == "__main__":
     data_path = "datasets/head"
     cpkt_save_path = "checkpoints/"
     num_iters = 5000
-    variance_kpnet = VarianceKPNetModel(in_channels=64, pose_dim=9, feature_dim=64, pose_embed=64)
+    variance_kpnet = VUDNet(feature_dim=64, dim_geo=32,
+                 dim_app=16,
+                 pose_dim=16,
+                 pose_embed=64)
     trainer = TrainerMultiView(variance_kpnet, data_path, cpkt_save_path, num_iters)
     trainer.train_iters()
-
+"""
+feature_dim=128,
+                 dim_geo=32,
+                 dim_app=16,
+                 pose_dim=9,
+                 pose_embed=128
+"""
 
         
             

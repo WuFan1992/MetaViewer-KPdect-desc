@@ -152,29 +152,37 @@ class SharedBackbone_XFeat(nn.Module):
 # Descriptor Encoder
 # -------------------------
 
-class DualDescriptorHead(nn.Module):
-    def __init__(self, in_dim=128, dim=128, bottleneck=32):
+class TripleDescriptorHead(nn.Module):
+    def __init__(self, in_dim=128, dim_inv=128, dim_geo=32, dim_app=16):
         super().__init__()
 
-        # invariant（高容量）
+        # invariant（matching用）
         self.inv_head = nn.Sequential(
-            nn.Conv2d(in_dim, dim, 3, padding=1),
-            nn.GroupNorm(8, dim),
+            nn.Conv2d(in_dim, dim_inv, 3, padding=1),
+            nn.GroupNorm(8, dim_inv),
             nn.ReLU(),
-            nn.Conv2d(dim, dim, 1)
+            nn.Conv2d(dim_inv, dim_inv, 1)
         )
 
-        # 🔥 variant（低容量 bottleneck）
-        self.var_head = nn.Sequential(
-            nn.Conv2d(in_dim, bottleneck, 3, padding=1),
+        # geometry（viewpoint）
+        self.geo_head = nn.Sequential(
+            nn.Conv2d(in_dim, dim_geo, 3, padding=1),
             nn.ReLU(),
-            nn.Conv2d(bottleneck, dim, 1)
+            nn.Conv2d(dim_geo, dim_geo, 1)
+        )
+
+        # appearance（光照/纹理）
+        self.app_head = nn.Sequential(
+            nn.Conv2d(in_dim, dim_app, 3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(dim_app, dim_app, 1)
         )
 
     def forward(self, x):
         f_inv = F.normalize(self.inv_head(x), dim=1)
-        f_var = self.var_head(x)
-        return f_inv, f_var
+        f_geo = self.geo_head(x)
+        f_app = self.app_head(x)
+        return f_inv, f_geo, f_app
 
 
 # -------------------------
@@ -182,19 +190,22 @@ class DualDescriptorHead(nn.Module):
 # -------------------------
 
 class UncertaintyHead(nn.Module):
-    def __init__(self, in_dim=128):
+    def __init__(self, in_dim=32):  # 🔥 改成 geo dim
         super().__init__()
 
         self.net = nn.Sequential(
-            nn.Conv2d(in_dim, 128, 3, padding=1),
+            nn.Conv2d(in_dim, 64, 3, padding=1),
             nn.ReLU(),
-            nn.Conv2d(128, 1, 1)
+            nn.Conv2d(64, 1, 1)
         )
 
-    def forward(self, feat):
-        log_sigma2 = self.net(feat)
-        sigma2 = F.softplus(log_sigma2) + 1e-4
-        return sigma2
+    def forward(self, f_geo):
+        log_sigma = self.net(f_geo)
+
+        # 🔥 bounded sigma（防爆）
+        sigma = 0.1 + 0.9 * torch.sigmoid(log_sigma)
+
+        return sigma
 
 
 # -------------------------
@@ -217,6 +228,41 @@ class ReliabilityHead(nn.Module):
 
     def forward(self, x):
 
+        return self.net(x)
+    
+    
+class GeometryTransform(nn.Module):
+    def __init__(self, geo_dim=32, pose_dim=128):
+        super().__init__()
+
+        self.mlp = nn.Sequential(
+            nn.Linear(geo_dim + pose_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, geo_dim)
+        )
+
+    def forward(self, f_geo, pose_embed):
+        """
+        f_geo: [N,C]
+        pose_embed: [N,P]
+        """
+        x = torch.cat([f_geo, pose_embed], dim=1)
+        delta = self.mlp(x)
+        return f_geo + delta
+    
+
+class FeatureDecoder(nn.Module):
+    def __init__(self, dim_inv=128, dim_geo=32, dim_app=16, out_dim=128):
+        super().__init__()
+
+        self.net = nn.Sequential(
+            nn.Linear(dim_inv + dim_geo + dim_app, 128),
+            nn.ReLU(),
+            nn.Linear(128, out_dim)
+        )
+
+    def forward(self, f_inv, f_geo, f_app):
+        x = torch.cat([f_inv, f_geo, f_app], dim=1)
         return self.net(x)
 
 
@@ -292,12 +338,12 @@ class PointDecoder(nn.Module):
 # Dense Feature AutoEncoder
 # -------------------------
 
-class VarianceKPNetModel(nn.Module):
-
+class VUDNet(nn.Module):
     def __init__(self,
-                 in_channels=64,
-                 pose_dim=9,
-                 feature_dim=64,
+                 feature_dim=128,
+                 dim_geo=32,
+                 dim_app=16,
+                 pose_dim=16,
                  pose_embed=128):
         super().__init__()
 
@@ -307,124 +353,113 @@ class VarianceKPNetModel(nn.Module):
         self.backbone = SharedBackbone_XFeat(out_dim=feature_dim)
 
         # -------------------------
-        # Descriptor (解耦)
+        # Disentangled encoder
         # -------------------------
-        self.descriptor_encoder = DualDescriptorHead(feature_dim, feature_dim)
+        self.encoder = TripleDescriptorHead(
+            in_dim=feature_dim,
+            dim_inv=feature_dim,
+            dim_geo=dim_geo,
+            dim_app=dim_app
+        )
 
         # -------------------------
-        # Heads（全部从 shared feature 出发）
+        # Heads
         # -------------------------
+        self.uncertainty_head = UncertaintyHead(dim_geo)
         self.reliability_head = ReliabilityHead(feature_dim)
 
-        # 🔥 改：variance 从 shared_feat，不是 desc
-        self.uncertainty_head = UncertaintyHead(feature_dim)
-
         # -------------------------
-        # Pose modules
+        # Geometry modules
         # -------------------------
         self.pose_encoder = PoseEncoder(pose_dim, pose_embed)
+        self.pose_proj = nn.Linear(64, dim_geo)  # 将 pose_embed 投影到 f_geo 的维度
+        self.geo_transform = GeometryTransform(dim_geo, pose_embed)
 
         # -------------------------
-        # FiLM
+        # Decoder（reconstruction）
         # -------------------------
-        self.film = FiLMModulation(pose_embed, feature_dim)
-
-        # -------------------------
-        # Decoder（只作用在 var branch）
-        # -------------------------
-        self.decoder = PointDecoder(feature_dim)
+        self.decoder = FeatureDecoder(
+            dim_inv=feature_dim,
+            dim_geo=dim_geo,
+            dim_app=dim_app,
+            out_dim=feature_dim
+        )
 
     # =========================================================
-    # Reconstruction（只用 desc_var）
-    # =========================================================
-    def reconstruction(self, desc_var, desc_inv, pose_src, pose_tgt, use_inv=False):
-        """
-        desc_var: [N,C]
-        desc_inv: [N,C]
-        """
-
-        device = desc_var.device
-
-        pose_src = pose_src.to(device).float()
-        pose_tgt = pose_tgt.to(device).float()
-
-        if pose_src.dim() == 2:
-            pose_src = pose_src.unsqueeze(0)
-        if pose_tgt.dim() == 2:
-            pose_tgt = pose_tgt.unsqueeze(0)
-
-        pose_ij = pose_matrix_to_9d(pose_src, pose_tgt)
-        pose_embed = self.pose_encoder(pose_ij)
-
-        if pose_embed.dim() == 1:
-            pose_embed = pose_embed.unsqueeze(0)
-
-        if pose_embed.shape[0] > 1:
-            pose_embed = pose_embed.mean(dim=0, keepdim=True)
-
-        N = desc_var.shape[0]
-        pose_embed = pose_embed.expand(N, -1)
-
-        # -------------------------
-        # ✅ 不再 detach！！
-        # -------------------------
-        latent = desc_var
-
-        # -------------------------
-        # FiLM modulation
-        # -------------------------
-        delta = self.film(latent, pose_embed)
-        latent = latent + delta
-
-        # -------------------------
-        # ❗阶段控制（避免 shortcut）
-        # -------------------------
-        if use_inv:
-            latent = latent + desc_inv
-
-        # -------------------------
-        # decode
-        # -------------------------
-        pred_desc = self.decoder(latent)
-        pred_desc = F.normalize(pred_desc, dim=1)
-
-        return pred_desc
-    
-    # =========================================================
-    # Forward
+    # 1️⃣ 基础 forward（只做 feature 提取）
     # =========================================================
     def forward(self, img):
 
-        # -------------------------
-        # 1. shared feature
-        # -------------------------
-        shared_featmap = self.backbone(img)  # [B,C,H,W]
+        shared = self.backbone(img)
 
-        # -------------------------
-        # 2. descriptor（解耦）
-        # -------------------------
-        desc_inv, desc_var = self.descriptor_encoder(shared_featmap)
+        f_inv, f_geo, f_app = self.encoder(shared)
 
-        # -------------------------
-        # 3. uncertainty（🔥关键改动）
-        # -------------------------
-        variance_map = self.uncertainty_head(shared_featmap)
+        sigma = self.uncertainty_head(f_geo)
 
-        # -------------------------
-        # 4. reliability（🔥建议也用 shared_feat）
-        # -------------------------
-        reliability_map = self.reliability_head(shared_featmap)
+        reliability = self.reliability_head(shared)
 
-        # -------------------------
-        # 输出（全部返回）
-        # -------------------------
         return {
-            "shared_feat": shared_featmap,
-            "desc_inv": desc_inv,
-            "desc_var": desc_var,
-            "variance": variance_map,
-            "reliability": reliability_map
+            "shared": shared,
+            "f_inv": f_inv,
+            "f_geo": f_geo,
+            "f_app": f_app,
+            "sigma": sigma,
+            "reliability": reliability
         }
 
+    # =========================================================
+    # 2️⃣ 几何变换（真正用到 pose_encoder + geo_transform）
+    # =========================================================
+    def transform_geo(self, f_geo, T_i, T_j):
+        """
+        f_geo: [N, C]
+        T_i, T_j: [4,4]
+        """
 
+        # --- 1. compute relative pose ---
+        T_i_inv = torch.inverse(T_i)
+        T_ji = T_j @ T_i_inv  # i → j
 
+        # --- 2. flatten ---
+        pose = T_ji.reshape(1, -1)  # [1,16]
+
+        # --- 3. encode ---
+        pose_embed = self.pose_encoder(pose)  # [1, pose_embed]
+
+        # expand to N points
+        N = f_geo.shape[0]
+        pose_embed = pose_embed.expand(N, -1)  # [N, pose_embed]
+
+        # --- 4. transform ---
+        f_geo_j = self.geo_transform(f_geo, pose_embed)
+
+        return f_geo_j
+
+    # =========================================================
+    # 3️⃣ reconstruction（真正用 decoder）
+    # =========================================================
+    def reconstruct_feature(self, f_inv, f_geo, f_app):
+        """
+        all: [N,C]
+        """
+        return self.decoder(f_inv, f_geo, f_app)
+
+    # =========================================================
+    # 4️⃣ joint prediction（论文里可以画图）
+    # =========================================================
+    def predict_view(self, f_inv_i, f_geo_i, f_app_i, pose_i, pose_j):
+        """
+        从 view i 预测 view j
+        """
+
+        # 1. geometry transform
+        f_geo_j = self.transform_geo(f_geo_i, pose_i, pose_j)
+
+        # 2. reconstruction
+        shared_j = self.reconstruct_feature(
+            f_inv_i,
+            f_geo_j,
+            f_app_i
+        )
+
+        return shared_j, f_geo_j
