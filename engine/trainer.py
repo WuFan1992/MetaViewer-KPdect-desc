@@ -174,7 +174,7 @@ class TrainerMultiView:
         
         
         self.data_loader = torch.utils.data.DataLoader(
-            self.dataset, batch_size=2, shuffle=True
+            self.dataset, batch_size=1, shuffle=True
         )
         self.optimizer = torch.optim.Adam(
             filter(lambda x: x.requires_grad, self.kpnet.parameters()), lr=3e-4
@@ -228,8 +228,8 @@ class TrainerMultiView:
                 max_points=50,
                 save_path=None  # 或 f"debug_{iter_idx}.png"
             )
-            
             """
+            
                
             
              # ===== forward each view =====
@@ -328,6 +328,7 @@ class TrainerMultiView:
                 
                 # descriptor loss
                 loss_desc_b = dual_softmax_loss(f_inv)
+                
 
                 # probabilistic loss
                 loss_prob_b = probabilistic_loss(f_inv, sigma)
@@ -384,17 +385,23 @@ class TrainerMultiView:
             w_rec = torch.sigmoid(torch.tensor((iter_idx - 3000)/500, device=self.device))
             w_cross = torch.sigmoid(torch.tensor((iter_idx - 3500)/500, device=self.device))
 
+
             loss = (
-                loss_desc +
-                0.1 * loss_prob +
-                0.1 * w_geo * loss_geo +
-                0.1 * w_rec * loss_recon +
-                0.1 * w_cross * loss_cross +
-                0.05 * loss_ortho +
-                0.05 * loss_rel
+                loss_desc + 
+                0.5 * loss_prob +
+                50.0 * w_geo * loss_geo +
+                1.0 * w_rec * loss_recon +
+                1.0 * w_cross * loss_cross +
+                20.0 * loss_ortho +
+                10.0 * loss_rel
             )
 
-
+            ######################
+            sim = f_inv[:,0,:] @ f_inv[:,1,:].t()
+            gt_sim = sim.diag().mean()
+            neg_sim = sim.mean()
+            print("pos:", gt_sim.item(), "neg:", neg_sim.item())
+            #####################
             # backward
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.kpnet.parameters(), 1.0)
@@ -406,8 +413,8 @@ class TrainerMultiView:
                 f"[Iter {iter_idx}] "
                 f"loss:{loss.item():.4f} "
                 f"desc:{loss_desc.item():.4f} "
-                f"prob:{loss_desc_total.item():.4f} "       # dual-softmax probability loss
-                f"geo:{loss_recon_total.item():.4f} "       # geometric / variant descriptor reconstruction
+                f"prob:{loss_prob.item():.4f} "       # dual-softmax probability loss
+                f"geo:{loss_geo.item():.4f} "       # geometric / variant descriptor reconstruction
                 f"rec:{loss_recon.item():.4f} "             # reconstruction loss
                 f"cross:{loss_cross.item():.4f} "             # feature variance / cross-view
                 f"ortho:{loss_ortho.item():.4f} "           # orthogonality loss
@@ -453,7 +460,7 @@ class TrainerMultiView:
 if __name__ == "__main__":
     data_path = "datasets/head"
     cpkt_save_path = "checkpoints/"
-    num_iters = 5000
+    num_iters = 30000
     variance_kpnet = VUDNet(feature_dim=64, dim_geo=32,
                  dim_app=16,
                  pose_dim=16,

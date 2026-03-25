@@ -13,7 +13,11 @@ def dual_softmax_loss(f_inv):
         for j in range(i+1, V):
             fi = f_inv[:, i, :]
             fj = f_inv[:, j, :]
-            sim = fi @ fj.t()
+            
+            #sim = fi @ fj.t()
+            temperature = 0.1
+            sim = (fi @ fj.t()) / temperature
+            
             log_p_ij = F.log_softmax(sim, dim=1)
             log_p_ji = F.log_softmax(sim.t(), dim=1)
             target = torch.arange(N, device=f_inv.device)
@@ -21,6 +25,7 @@ def dual_softmax_loss(f_inv):
             total_loss += loss
             count += 1
     return total_loss / count
+
 
 def probabilistic_loss(f_inv, sigma):
     N, V, C = f_inv.shape
@@ -86,7 +91,7 @@ def geo_loss(kpnet, f_geo, T_list, batch_idx):
             pred_j = kpnet.transform_geo(f_i, T_i, T_j)
 
             # --- loss ---
-            loss += F.mse_loss(pred_j, f_j)
+            loss += F.mse_loss(pred_j, f_j.detach())
 
             count += 1
 

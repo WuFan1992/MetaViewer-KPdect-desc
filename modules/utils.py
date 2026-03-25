@@ -172,7 +172,7 @@ def sample_map_at_coords(fmap, coords, H, W):
     sampled = F.grid_sample(
         fmap, coords_norm,
         mode='bilinear',
-        align_corners=False
+        align_corners=True
     )  # [1, C, N, 1]
 
     # ===== 5. reshape → [N,C] =====
