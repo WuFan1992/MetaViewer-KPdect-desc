@@ -306,12 +306,14 @@ class TrainerMultiView:
             # compute losses
             # =========================
             loss_desc_total = 0.0
-            loss_prob_total = 0.0
+            loss_sigma_total = 0.0
             loss_ortho_total = 0.0
             loss_geo_total = 0.0
+            loss_geo_mag_total = 0.0
             loss_recon_total = 0.0
             loss_cross_total = 0.0
             loss_rel_total = 0.0
+            loss_inv_total = 0.0
             valid_batch = 0
 
             for b in range(len(f_inv_list)):
@@ -329,9 +331,11 @@ class TrainerMultiView:
                 # descriptor loss
                 loss_desc_b = dual_softmax_loss(f_inv)
                 
+                # invariance loss
+                loss_inv_b = multi_view_invariant_loss(f_inv)
 
                 # probabilistic loss
-                loss_prob_b = probabilistic_loss(f_inv, sigma)
+                loss_sigma_b = sigma_viewpoint_loss(f_geo, sigma)
 
                 # orthogonality
                 loss_ortho_geo = orthogonality_loss(f_inv, f_geo)
@@ -342,6 +346,9 @@ class TrainerMultiView:
                 # geometry loss
                 T_list = [T.to(self.device, dtype=torch.float) for T in batch_data['T']]
                 loss_geo_b = geo_loss(self.kpnet, f_geo, T_list, batch_idx=b)
+                
+                # magnitude geometry loss
+                loss_geo_mag_b = geo_magnitude_loss(f_geo, T_list, batch_idx=b)
 
                 # reconstruction loss
                 loss_recon_b = recon_loss(self.kpnet, f_inv, f_geo, f_app, shared)
@@ -356,27 +363,31 @@ class TrainerMultiView:
 
                 # accumulate
                 loss_desc_total += loss_desc_b
-                loss_prob_total += loss_prob_b
+                loss_sigma_total += loss_sigma_b
                 loss_ortho_total += loss_ortho_total_b
                 loss_geo_total += loss_geo_b
+                loss_geo_mag_total += loss_geo_mag_b
                 loss_recon_total += loss_recon_b
                 loss_cross_total += loss_cross_b
                 loss_rel_total += loss_rel_b
+                loss_inv_total += loss_inv_b
                 valid_batch += 1
 
             # normalize
             if valid_batch > 0:
                 loss_desc = loss_desc_total / valid_batch
-                loss_prob = loss_prob_total / valid_batch
+                loss_sigma = loss_sigma_total / valid_batch
                 loss_ortho = loss_ortho_total / valid_batch
                 loss_geo = loss_geo_total / valid_batch
+                loss_geo_mag = loss_geo_mag_total / valid_batch
                 loss_recon = loss_recon_total / valid_batch
                 loss_cross = loss_cross_total / valid_batch
                 loss_rel  = loss_rel_total / valid_batch
+                loss_inv = loss_inv_total / valid_batch
                 
             else:
                 dummy = 0.0 * next(self.kpnet.parameters()).sum()
-                loss_desc = loss_prob = loss_ortho = loss_geo = loss_recon = loss_cross = loss_rel = dummy
+                loss_desc = loss_sigma = loss_ortho = loss_geo = loss_geo_mag = loss_recon = loss_cross = loss_rel = dummy
 
             # -------------------------
             # final weighted loss (smooth schedule)
@@ -388,19 +399,23 @@ class TrainerMultiView:
 
             loss = (
                 loss_desc + 
-                0.5 * loss_prob +
+                0.2 * loss_inv +                 # multi-view invariant
+                1.0 * loss_sigma +              # ⭐核心
+                10.0 * loss_geo_mag +           # ⭐关键
                 50.0 * w_geo * loss_geo +
                 1.0 * w_rec * loss_recon +
                 1.0 * w_cross * loss_cross +
-                20.0 * loss_ortho +
-                10.0 * loss_rel
-            )
+                10.0 * loss_ortho +
+                5.0 * loss_rel
+            )   
 
             ######################
+            """
             sim = f_inv[:,0,:] @ f_inv[:,1,:].t()
             gt_sim = sim.diag().mean()
             neg_sim = sim.mean()
             print("pos:", gt_sim.item(), "neg:", neg_sim.item())
+            """
             #####################
             # backward
             loss.backward()
@@ -413,8 +428,10 @@ class TrainerMultiView:
                 f"[Iter {iter_idx}] "
                 f"loss:{loss.item():.4f} "
                 f"desc:{loss_desc.item():.4f} "
-                f"prob:{loss_prob.item():.4f} "       # dual-softmax probability loss
+                f"inv:{loss_inv.item():.4f} "
+                f"sigma:{loss_sigma.item():.4f} "       # dual-softmax probability loss
                 f"geo:{loss_geo.item():.4f} "       # geometric / variant descriptor reconstruction
+                f"geo mag:{loss_geo_mag.item():.4f} " 
                 f"rec:{loss_recon.item():.4f} "             # reconstruction loss
                 f"cross:{loss_cross.item():.4f} "             # feature variance / cross-view
                 f"ortho:{loss_ortho.item():.4f} "           # orthogonality loss
@@ -432,13 +449,15 @@ class TrainerMultiView:
             # -------------------------
             self.writer.add_scalar('Loss/total', loss.item(), iter_idx)
             self.writer.add_scalar('Loss/description', loss_desc.item(), iter_idx)   # descriptor Mahalanobis
+            self.writer.add_scalar('Loss/inv', loss_inv.item(), iter_idx)
             self.writer.add_scalar('Loss/reconstruction', loss_recon.item(), iter_idx) # reconstruction loss (variant->shared)
             self.writer.add_scalar('Loss/reliability', loss_rel.item(), iter_idx)    # reliability BCE
-            self.writer.add_scalar('Loss/variance',loss_cross.item(), iter_idx)       # feature variance loss
+            self.writer.add_scalar('Loss/cross',loss_cross.item(), iter_idx)       # feature variance loss
+            self.writer.add_scalar('Loss/invariance',loss_inv.item(), iter_idx)       # feature variance loss
             self.writer.add_scalar('Loss/orthogonality', loss_ortho.item(), iter_idx) # orthogonality between inv/var
-            self.writer.add_scalar('Loss/prob', loss_desc_total.item(), iter_idx)     # dual-softmax probability loss
-            self.writer.add_scalar('Loss/geo', loss_recon_total.item(), iter_idx)     # geometric / variant descriptor reconstruction
-
+            self.writer.add_scalar('Loss/sigma', loss_sigma.item(), iter_idx)     # dual-softmax probability loss
+            self.writer.add_scalar('Loss/geo', loss_geo.item(), iter_idx)     # geometric / variant descriptor reconstruction
+            self.writer.add_scalar('Loss/geo_mag', loss_geo_mag.item(), iter_idx)     # geometric / variant descriptor reconstruction
 
 
 

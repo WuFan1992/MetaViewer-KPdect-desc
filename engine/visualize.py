@@ -59,7 +59,10 @@ def run_test(image_path, checkpoint_path, device="cuda"):
     device = torch.device(device if torch.cuda.is_available() else "cpu")
 
     # ===== 1. 初始化模型 =====
-    model = VarianceKPNetModel(in_channels=64, pose_dim=9, feature_dim=64, pose_embed=64)
+    model = VUDNet(feature_dim=64, dim_geo=32,
+                 dim_app=16,
+                 pose_dim=16,
+                 pose_embed=64)
     
     # ===== 2. 加载权重 =====
     state_dict = torch.load(checkpoint_path, map_location=device)
@@ -83,11 +86,11 @@ def run_test(image_path, checkpoint_path, device="cuda"):
 
     # ===== 4. forward =====
     with torch.no_grad():
-        _, var_map, desc_map, rel_map = model(img_tensor)
+        out = model(img_tensor)
 
     # 👉 H/4, W/4
-    var_map = var_map[0,0].cpu().numpy()
-    rel_map = rel_map[0,0].cpu().numpy()
+    var_map = out["sigma"][0,0].cpu().numpy()
+    rel_map = out["reliability"][0,0].cpu().numpy()
 
     print("var range:", var_map.min(), var_map.max())
     print("rel range:", rel_map.min(), rel_map.max())
@@ -137,6 +140,7 @@ def run_test(image_path, checkpoint_path, device="cuda"):
     return kpts_up
 
 if __name__ == "__main__":
-    data_path = "datasets/MegaDepth_v1/0022/dense0/imgs/186069410_b743faece0_o.jpg"
-    cpkt_save_path = "checkpoints/kpnet_iter_4999.pth"
+    #data_path = "datasets/MegaDepth_v1/0022/dense0/imgs/186069410_b743faece0_o.jpg"
+    data_path = "datasets/MegaDepth_v1/0022/dense0/imgs/8232974_61eb861d2c_o.jpg"
+    cpkt_save_path = "checkpoints/kpnet_iter_79999.pth"
     run_test(data_path, cpkt_save_path)

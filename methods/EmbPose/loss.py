@@ -26,22 +26,38 @@ def dual_softmax_loss(f_inv):
             count += 1
     return total_loss / count
 
+def multi_view_invariant_loss(f_inv):
+    """
+    f_inv: [N, V, C]
+    目标：同一个3D点在所有view下descriptor一致
+    """
 
-def probabilistic_loss(f_inv, sigma):
-    N, V, C = f_inv.shape
-    loss = 0
-    count = 0
-    for i in range(V):
-        for j in range(i+1, V):
-            fi = f_inv[:, i, :]
-            fj = f_inv[:, j, :]
-            si = sigma[:, i, 0]
-            sj = sigma[:, j, 0]
-            dist = ((fi - fj) ** 2).sum(dim=1)
-            s = si + sj
-            loss += (dist / s + torch.log(s)).mean()
-            count += 1
-    return loss / count
+    # 计算每个点的“中心”
+    center = f_inv.mean(dim=1, keepdim=True)  # [N,1,C]
+
+    # 所有 view 拉向 center
+    loss = ((f_inv - center) ** 2).sum(dim=-1).mean()
+
+    return loss
+
+
+def sigma_viewpoint_loss(f_geo, sigma):
+    """
+    f_geo:  [N,V,C]
+    sigma:  [N,V,1]
+    """
+
+    # --- GT: feature variance across views ---
+    var = f_geo.var(dim=1).mean(dim=1)   # [N]
+
+    # --- prediction ---
+    sigma_pred = sigma.mean(dim=1).squeeze(-1)  # [N]
+
+    # normalize（很重要，避免scale问题）
+    var = (var - var.mean()) / (var.std() + 1e-6)
+    sigma_pred = (sigma_pred - sigma_pred.mean()) / (sigma_pred.std() + 1e-6)
+
+    return F.mse_loss(sigma_pred, var.detach())
 
 def orthogonality_loss(f_inv, f_geo):
     """
@@ -61,6 +77,57 @@ def orthogonality_loss(f_inv, f_geo):
     # 计算正交性
     dot = (f_inv_norm * f_geo_norm).sum(dim=-1)  # [N, V]
     return (dot ** 2).mean()
+
+def pose_distance(T_i, T_j):
+
+    # --- translation ---
+    t_i = T_i[:3, 3]
+    t_j = T_j[:3, 3]
+    dt = torch.norm(t_i - t_j)
+
+    # --- rotation ---
+    R_i = T_i[:3, :3]
+    R_j = T_j[:3, :3]
+
+    R_rel = R_j @ R_i.T
+    cos_theta = (torch.trace(R_rel) - 1) / 2
+    cos_theta = torch.clamp(cos_theta, -1.0, 1.0)
+    dR = torch.acos(cos_theta)
+
+    # 🔥 normalize（关键）
+    dt = dt / (dt.detach() + 1e-6)
+    dR = dR / (dR.detach() + 1e-6)
+
+    return dt + dR
+
+def geo_magnitude_loss(f_geo, T_list, batch_idx):
+    """
+    强制：feature变化 ∝ 相机变化
+    """
+    N, V, C = f_geo.shape
+
+    loss = 0.0
+    count = 0
+
+    for i in range(V):
+        for j in range(i+1, V):
+
+            T_i = T_list[i][batch_idx]
+            T_j = T_list[j][batch_idx]
+
+            # feature difference
+            df = (f_geo[:, i, :] - f_geo[:, j, :]).norm(dim=1)  # [N]
+
+            # pose difference（scalar）
+            dp = pose_distance(T_i, T_j)
+
+            # normalize df
+            df = df / (df.mean() + 1e-6)
+
+            loss += ((df - dp) ** 2).mean()
+            count += 1
+
+    return loss / count
 
 def geo_loss(kpnet, f_geo, T_list, batch_idx):
     """
