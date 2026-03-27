@@ -142,5 +142,5 @@ def run_test(image_path, checkpoint_path, device="cuda"):
 if __name__ == "__main__":
     #data_path = "datasets/MegaDepth_v1/0022/dense0/imgs/186069410_b743faece0_o.jpg"
     data_path = "datasets/MegaDepth_v1/0022/dense0/imgs/8232974_61eb861d2c_o.jpg"
-    cpkt_save_path = "checkpoints/kpnet_iter_79999.pth"
+    cpkt_save_path = "checkpoints/kpnet_iter_19999.pth"
     run_test(data_path, cpkt_save_path)

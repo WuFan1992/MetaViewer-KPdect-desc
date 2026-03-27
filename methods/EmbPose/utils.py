@@ -57,33 +57,3 @@ def pose_matrix_to_9d(pose_i, pose_j):
     return pose_9d
 
 
-class DynamicLossWeights:
-    def __init__(self, init_weights=None, target_contrib=0.25, momentum=0.9):
-        """
-        init_weights: 初始权重 dict, e.g. {'var':0.2,'ds':0.1,'kp':5,'rec':0.5}
-        target_contrib: 每个任务期望贡献到总 loss 的比例
-        momentum: 平滑更新
-        """
-        self.weights = init_weights if init_weights is not None else {'var':0.2,'ds':0.1,'kp':5,'rec':0.5}
-        self.target = target_contrib
-        self.momentum = momentum
-        # 保存历史平均 loss
-        self.loss_ema = {'var': 1.0, 'ds': 1.0, 'kp': 1.0, 'rec': 1.0}
-
-    def update_ema(self, losses_dict):
-        """
-        losses_dict: 当前 iteration 的各任务 loss, e.g. {'var':1.42,'ds':2.55,...}
-        """
-        for k in losses_dict:
-            self.loss_ema[k] = self.momentum*self.loss_ema[k] + (1-self.momentum)*losses_dict[k]
-
-    def get_weights(self):
-        """
-        根据 EMA loss 计算权重，使每个任务贡献接近 target
-        w_task = target / loss_task_mean
-        """
-        new_weights = {}
-        for k, l in self.loss_ema.items():
-            new_weights[k] = self.target / (l + 1e-6)
-        self.weights = new_weights
-        return self.weights

@@ -5,6 +5,7 @@ from modules.utils import sample_map_at_coords
 # -------------------------
 # Loss functions
 # -------------------------
+"""
 def dual_softmax_loss(f_inv):
     N, V, C = f_inv.shape
     total_loss = 0
@@ -25,27 +26,34 @@ def dual_softmax_loss(f_inv):
             total_loss += loss
             count += 1
     return total_loss / count
+"""
+def mv_infonce(f_inv):
+    N, V, C = f_inv.shape
+    f = F.normalize(f_inv, dim=-1)
 
-def multi_view_invariant_loss(f_inv):
-    """
-    f_inv: [N, V, C]
-    目标：同一个3D点在所有view下descriptor一致
-    """
+    loss = 0
+    count = 0
 
-    # 计算每个点的“中心”
-    center = f_inv.mean(dim=1, keepdim=True)  # [N,1,C]
+    for i in range(V):
+        for j in range(V):
+            if i == j: continue
 
-    # 所有 view 拉向 center
-    loss = ((f_inv - center) ** 2).sum(dim=-1).mean()
+            sim = f[:, i] @ f[:, j].t()  # [N,N]
+            logits = sim / 0.07
 
-    return loss
+            labels = torch.arange(N, device=f.device)
+
+            loss += F.cross_entropy(logits, labels)
+            count += 1
+
+    return loss / count
 
 
 def sigma_viewpoint_loss(f_geo, sigma):
-    """
-    f_geo:  [N,V,C]
-    sigma:  [N,V,1]
-    """
+    
+    #f_geo:  [N,V,C]
+    #sigma:  [N,V,1]
+    
 
     # --- GT: feature variance across views ---
     var = f_geo.var(dim=1).mean(dim=1)   # [N]
@@ -56,8 +64,10 @@ def sigma_viewpoint_loss(f_geo, sigma):
     # normalize（很重要，避免scale问题）
     var = (var - var.mean()) / (var.std() + 1e-6)
     sigma_pred = (sigma_pred - sigma_pred.mean()) / (sigma_pred.std() + 1e-6)
+    
 
     return F.mse_loss(sigma_pred, var.detach())
+
 
 def orthogonality_loss(f_inv, f_geo):
     """
@@ -100,34 +110,6 @@ def pose_distance(T_i, T_j):
 
     return dt + dR
 
-def geo_magnitude_loss(f_geo, T_list, batch_idx):
-    """
-    强制：feature变化 ∝ 相机变化
-    """
-    N, V, C = f_geo.shape
-
-    loss = 0.0
-    count = 0
-
-    for i in range(V):
-        for j in range(i+1, V):
-
-            T_i = T_list[i][batch_idx]
-            T_j = T_list[j][batch_idx]
-
-            # feature difference
-            df = (f_geo[:, i, :] - f_geo[:, j, :]).norm(dim=1)  # [N]
-
-            # pose difference（scalar）
-            dp = pose_distance(T_i, T_j)
-
-            # normalize df
-            df = df / (df.mean() + 1e-6)
-
-            loss += ((df - dp) ** 2).mean()
-            count += 1
-
-    return loss / count
 
 def geo_loss(kpnet, f_geo, T_list, batch_idx):
     """
@@ -161,6 +143,49 @@ def geo_loss(kpnet, f_geo, T_list, batch_idx):
             loss += F.mse_loss(pred_j, f_j.detach())
 
             count += 1
+
+    return loss / count if count > 0 else torch.tensor(0.0, device=f_geo.device)
+
+def geo_cycle_loss(kpnet, f_geo, T_list, batch_idx):
+    """
+    Cycle-consistent geometry loss
+
+    f_geo: [N, V, C]
+    T_list: list of [B,4,4]
+    """
+
+    N, V, C = f_geo.shape
+    loss = 0.0
+    count = 0
+
+    for i in range(V):
+        for j in range(V):
+            for k in range(V):
+
+                if i == j or j == k or i == k:
+                    continue
+
+                # --- poses ---
+                T_i = T_list[i][batch_idx]
+                T_j = T_list[j][batch_idx]
+                T_k = T_list[k][batch_idx]
+
+                # --- features ---
+                f_i = f_geo[:, i, :]  # [N,C]
+
+                # i → j
+                f_j = kpnet.transform_geo(f_i, T_i, T_j)
+
+                # j → k
+                f_k = kpnet.transform_geo(f_j, T_j, T_k)
+
+                # k → i
+                f_i_cycle = kpnet.transform_geo(f_k, T_k, T_i)
+
+                # --- cycle loss ---
+                loss += F.mse_loss(f_i_cycle, f_i.detach())
+
+                count += 1
 
     return loss / count if count > 0 else torch.tensor(0.0, device=f_geo.device)
 

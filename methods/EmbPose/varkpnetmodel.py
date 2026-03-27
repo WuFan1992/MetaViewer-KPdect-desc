@@ -442,7 +442,7 @@ class VUDNet(nn.Module):
         """
         all: [N,C]
         """
-        return self.decoder(f_inv.detach(), f_geo, f_app.detach())
+        return self.decoder(f_inv, f_geo.detach(), f_app)
 
     # =========================================================
     # 4️⃣ joint prediction（论文里可以画图）
