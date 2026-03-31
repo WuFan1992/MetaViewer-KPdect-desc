@@ -27,7 +27,11 @@ def dual_softmax_loss(f_inv):
             count += 1
     return total_loss / count
 """
-def mv_infonce(f_inv):
+def mv_infonce_masked(f_inv, visibility):
+    """
+    f_inv: [N, V, C]
+    visibility: [N, V] (bool)
+    """
     N, V, C = f_inv.shape
     f = F.normalize(f_inv, dim=-1)
 
@@ -36,15 +40,27 @@ def mv_infonce(f_inv):
 
     for i in range(V):
         for j in range(V):
-            if i == j: continue
+            if i == j:
+                continue
 
-            sim = f[:, i] @ f[:, j].t()  # [N,N]
+            mask = visibility[:, i] & visibility[:, j]  # ✅ 只用共可见点
+
+            if mask.sum() < 10:
+                continue
+
+            fi = f[mask, i]
+            fj = f[mask, j]
+
+            sim = fi @ fj.t()
             logits = sim / 0.07
 
-            labels = torch.arange(N, device=f.device)
+            labels = torch.arange(fi.shape[0], device=f.device)
 
             loss += F.cross_entropy(logits, labels)
             count += 1
+
+    if count == 0:
+        return torch.tensor(0.0, device=f.device, requires_grad=True)
 
     return loss / count
 
@@ -69,106 +85,44 @@ def cosine_variance(feat):
 
     return var / count
 
-def sigma_loss_teacher_multi_view(feat_teacher, sigma_pred):
+def sigma_loss_teacher_multi_view_masked(feat_teacher, sigma_pred, visibility):
     """
-    Multi-view cosine variance loss for sigma supervision.
-
-    Args:
-        feat_teacher: [N, V, C] backbone features for N points, V views
-                      detached from backbone (no grad)
-        sigma_pred:   [N, V, 1] predicted sigma from network
-
-    Returns:
-        loss: MSE loss between predicted sigma and multi-view variance
+    feat_teacher: [N,V,C]
+    sigma_pred: [N,V,1]
+    visibility: [N,V]
     """
-    N, V, C = feat_teacher.shape
-    # 1. normalize features
-    f_norm = F.normalize(feat_teacher, dim=-1)  # [N,V,C]
+    f_norm = F.normalize(feat_teacher, dim=-1)
 
-    # 2. compute pairwise cosine similarity between views
     cos_sim = torch.einsum('nvc,nwc->nvw', f_norm, f_norm)  # [N,V,V]
 
-    # 3. compute variance per view: 1 - mean similarity
-    cos_var = 1 - cos_sim.mean(dim=2)  # [N,V]
+    loss = 0
+    count = 0
 
-    # 4. normalize variance (zero mean, unit std) per point
-    cos_var = (cos_var - cos_var.mean(dim=1, keepdim=True)) / (cos_var.std(dim=1, keepdim=True) + 1e-6)
-
-    # 5. flatten sigma_pred
-    sigma_flat = sigma_pred.squeeze(-1)  # [N,V]
-
-    # 6. MSE loss
-    loss = F.mse_loss(sigma_flat, cos_var.detach())
-    return loss
-
-"""
-def sigma_loss(kpnet, f_geo, sigma, T_list, batch_idx):
-    
-    #f_geo: [N, V, C]
-    #sigma: [N, V, 1]
-    #ranking loss: all points pairwise, no random sampling
-    
-    device = f_geo.device
-    N, V, C = f_geo.shape
-
-    # 1. compute multi-view error per point
-    error_list = []
+    V = feat_teacher.shape[1]
 
     for i in range(V):
-        for j in range(V):
-            if i == j:
+        for j in range(i+1, V):
+            mask = visibility[:, i] & visibility[:, j]
+
+            if mask.sum() < 10:
                 continue
 
-            T_i = T_list[i][batch_idx]
-            T_j = T_list[j][batch_idx]
+            sim = cos_sim[mask, i, j]
 
-            f_i = f_geo[:, i, :]  # [N,C]
-            f_j = f_geo[:, j, :]  # [N,C]
+            var_target = 1 - sim
 
-            pred_j = kpnet.transform_geo(f_i, T_i, T_j)
+            sigma_i = sigma_pred[mask, i, 0]
+            sigma_j = sigma_pred[mask, j, 0]
 
-            # detach to avoid gradient through error itself
-            err = ((pred_j.detach() - f_j.detach()) ** 2).mean(dim=1)  # [N]
+            loss += F.mse_loss(sigma_i, var_target.detach())
+            loss += F.mse_loss(sigma_j, var_target.detach())
 
-            error_list.append(err)
+            count += 2
 
-    # [N, num_pairs]
-    error = torch.stack(error_list, dim=1).mean(dim=1)  # [N]
+    if count == 0:
+        return torch.tensor(0.0, device=feat_teacher.device, requires_grad=True)
 
-    # 2. aggregate sigma per point (average across views)
-    sigma_point = sigma.squeeze(-1).mean(dim=1)  # [N]
-
-    # 3. full pairwise ranking loss
-    # 构建 pairwise matrix
-    diff_sigma = sigma_point.unsqueeze(0) - sigma_point.unsqueeze(1)  # [N,N]
-    diff_error = error.unsqueeze(0) - error.unsqueeze(1)                # [N,N]
-
-    target = (diff_error > 0).float()  # 如果 error_i > error_j, target=1
-
-    # 排除对角线（i==j）
-    mask = 1 - torch.eye(N, device=device)
-    loss_rank = F.binary_cross_entropy_with_logits(
-        diff_sigma * mask,
-        target * mask
-    )
-
-    # 4. multi-view consistency
-    loss_cons = 0.0
-    count = 0
-    for i in range(V):
-        for j in range(V):
-            if i == j: continue
-            loss_cons += (sigma[:, i] - sigma[:, j]).abs().mean()
-            count += 1
-    loss_cons = loss_cons / count if count > 0 else 0.0
-
-    # 5. anti-collapse
-    loss_reg = sigma_point.mean()
-
-    # 6. final
-    loss = loss_rank + 0.1 * loss_cons + 0.05 * loss_reg
-    return loss
-"""
+    return loss / count
 
 def geo_loss(kpnet, f_geo, T_list, batch_idx):
     """

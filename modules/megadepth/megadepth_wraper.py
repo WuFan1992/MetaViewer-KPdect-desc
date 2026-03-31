@@ -2,6 +2,32 @@ import torch
 from kornia.utils import create_meshgrid
 import pdb
 
+from collections import defaultdict
+def split_points_by_visibility(multi_corrs, min_views=(2,3,4,5)):
+    """
+    将 multi_corrs 按照可见 view 数拆分
+    Args:
+        multi_corrs: list of dicts, each dict has:
+            'points': [N, 5, 2]
+            'visibility': [N, 5] bool
+        min_views: tuple of int, e.g. (2,3,4,5)
+    Returns:
+        batch_points_dict: dict k -> list of (points, vis)
+    """
+    batch_points_dict = {k: [] for k in min_views}
+
+    for b, data_b in enumerate(multi_corrs):
+        pts = data_b['points']      # [N,5,2]
+        vis = data_b['visibility']  # [N,5] bool
+
+        num_vis = vis.sum(dim=1)    # [N] 每个点可见 view 数
+
+        for k in min_views:
+            mask = (num_vis == k)
+            if mask.sum() > 0:
+                batch_points_dict[k].append( (pts[mask], vis[mask]) )
+
+    return batch_points_dict
 
 @torch.no_grad()
 def warp_kpts(kpts0, depth0, depth1, T_0to1, K0, K1):
@@ -55,8 +81,8 @@ def warp_kpts(kpts0, depth0, depth1, T_0to1, K0, K1):
     w_kpts0 = w_kpts0_h[:, :, :2] / (w_kpts0_h[:, :, [2]] + 1e-5)  # (N, L, 2), +1e-4 to avoid zero depth
 
     # Covisible Check
-    # h, w = depth1.shape[1:3]
-    # covisible_mask = (w_kpts0[:, :, 0] > 0) * (w_kpts0[:, :, 0] < w-1) * \
+    #h, w = depth1.shape[1:3]
+    #covisible_mask = (w_kpts0[:, :, 0] > 0) * (w_kpts0[:, :, 0] < w-1) * \
     #     (w_kpts0[:, :, 1] > 0) * (w_kpts0[:, :, 1] < h-1)
     # w_kpts0_long = w_kpts0.long()
     # w_kpts0_long[~covisible_mask, :] = 0
@@ -71,12 +97,97 @@ def warp_kpts(kpts0, depth0, depth1, T_0to1, K0, K1):
 
     return valid_mask, w_kpts0
 
-
+@torch.no_grad()
 def spvs_coarse_multi_cycle(data, scale=8, cycle_thresh=1.5):
-    """
-    5-view multi-view + cycle consistency
-    支持 batch >= 1
-    """
+    device = data['images'][0].device
+    B = data['images'][0].shape[0]
+
+    images = data['images']
+    depths = data['depths']
+    Ks = data['Ks']
+    T_0to = data['T_0to']
+    scales = data['scales']
+
+    ref_img = images[0]
+    ref_depth = depths[0]
+    ref_K = Ks[0]
+
+    _, _, H, W = ref_img.shape
+    h, w = H // scale, W // scale
+
+    # ===== 1. grid =====
+    grid = create_meshgrid(h, w, False, device).reshape(1, h*w, 2)
+    grid_i = grid.repeat(B, 1, 1) * scale  # [B, L, 2]
+
+    V = len(images)
+
+    all_points = [grid_i]      # list of [B, L, 2]
+    valids_per_view = []       # list of [B, L]
+
+    # ===== 2. per-view warp =====
+    for i in range(1, V):
+        valid_fw, warped_fw = warp_kpts(
+            grid_i, ref_depth, depths[i], T_0to[i], ref_K, Ks[i]
+        )
+
+        T_i_to_0 = torch.inverse(T_0to[i])
+        valid_bw, warped_bw = warp_kpts(
+            warped_fw, depths[i], ref_depth, T_i_to_0, Ks[i], ref_K
+        )
+
+        dist = torch.norm(grid_i - warped_bw, dim=-1)
+        mask_cycle = dist < cycle_thresh
+
+        valid = valid_fw & valid_bw & mask_cycle
+
+        valids_per_view.append(valid)   # ✅ 不再做AND
+        all_points.append(warped_fw)
+
+    # ===== 3. build visibility =====
+    # view0默认全True
+    visibility = torch.stack(
+        [torch.ones_like(valids_per_view[0])] + valids_per_view,
+        dim=1
+    )  # [B, V, L]
+
+    # ===== 4. stack all points =====
+    all_points = torch.stack(all_points, dim=1)  # [B, V, L, 2]
+
+    # ===== 5. 输出统一结构 =====
+    multi_corrs_batch = []
+
+    for b in range(B):
+        vis = visibility[b]        # [V, L]
+        pts = all_points[b]        # [V, L, 2]
+
+        # 转成 [L, V, 2]
+        pts = pts.permute(1, 0, 2)
+        vis = vis.permute(1, 0)    # [L, V]
+
+        # ===== scale回原图 =====
+        for v in range(V):
+            scale_v = scales[v][b] if isinstance(scales[v], torch.Tensor) else scales[v]
+            pts[:, v] /= scale_v
+
+        # ===== 过滤至少2-view =====
+        valid_mask = vis.sum(dim=1) >= 2
+
+        pts = pts[valid_mask]   # [N, V, 2]
+        vis = vis[valid_mask]   # [N, V]
+
+        multi_corrs_batch.append({
+            'points': pts,          # [N, 5, 2]
+            'visibility': vis       # [N, 5] bool
+        })
+
+    return multi_corrs_batch
+
+"""
+def spvs_coarse_multi_cycle(data, scale=8, cycle_thresh=1.5):
+    
+    #5-view multi-view + cycle consistency
+    #支持 batch >= 1
+    
     device = data['images'][0].device
     B = data['images'][0].shape[0]  # batch size
 
@@ -139,8 +250,8 @@ def spvs_coarse_multi_cycle(data, scale=8, cycle_thresh=1.5):
         multi_corrs_batch.append(multi_corrs)
 
     return multi_corrs_batch  # list of length B, 每个元素 [num_points, 5, 2]
-
-    """
+"""
+"""
     multi_coors: [N, 5, 2]
     N 是匹配点的数量
     
@@ -152,5 +263,13 @@ def spvs_coarse_multi_cycle(data, scale=8, cycle_thresh=1.5):
     [x4, y4],   # image4
 ]
 
-    """
+"""
+"""
+counts = visibility.sum(dim=1)
 
+pts_2 = points[counts == 2]
+pts_3 = points[counts == 3]
+pts_4 = points[counts == 4]
+pts_5 = points[counts == 5]
+
+"""
