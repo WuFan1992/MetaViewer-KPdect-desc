@@ -48,68 +48,116 @@ def mv_infonce(f_inv):
 
     return loss / count
 
-
-def sigma_viewpoint_loss(f_geo, sigma):
-    
-    #f_geo:  [N,V,C]
-    #sigma:  [N,V,1]
-    
-
-    # --- GT: feature variance across views ---
-    var = f_geo.var(dim=1).mean(dim=1)   # [N]
-
-    # --- prediction ---
-    sigma_pred = sigma.mean(dim=1).squeeze(-1)  # [N]
-
-    # normalize（很重要，避免scale问题）
-    var = (var - var.mean()) / (var.std() + 1e-6)
-    sigma_pred = (sigma_pred - sigma_pred.mean()) / (sigma_pred.std() + 1e-6)
-    
-
-    return F.mse_loss(sigma_pred, var.detach())
-
-
-def orthogonality_loss(f_inv, f_geo):
+def cosine_variance(feat):
     """
-    计算描述子和几何特征的正交性
-    f_inv: [N, V, C_inv]
-    f_geo: [N, V, C_geo]
+    feat: [N, V, C] (already normalized or not)
+    return: [N]
     """
-    # 统一通道数
-    C = min(f_inv.shape[-1], f_geo.shape[-1])
-    f_inv_proj = f_inv[..., :C]
-    f_geo_proj = f_geo[..., :C]
 
-    # 归一化
-    f_inv_norm = F.normalize(f_inv_proj, dim=-1)
-    f_geo_norm = F.normalize(f_geo_proj, dim=-1)
+    N, V, C = feat.shape
 
-    # 计算正交性
-    dot = (f_inv_norm * f_geo_norm).sum(dim=-1)  # [N, V]
-    return (dot ** 2).mean()
+    feat = F.normalize(feat, dim=-1)
 
-def pose_distance(T_i, T_j):
+    var = 0.0
+    count = 0
 
-    # --- translation ---
-    t_i = T_i[:3, 3]
-    t_j = T_j[:3, 3]
-    dt = torch.norm(t_i - t_j)
+    for i in range(V):
+        for j in range(i + 1, V):
+            sim = (feat[:, i] * feat[:, j]).sum(dim=-1)  # cosine
+            var += (1.0 - sim)
+            count += 1
 
-    # --- rotation ---
-    R_i = T_i[:3, :3]
-    R_j = T_j[:3, :3]
+    return var / count
 
-    R_rel = R_j @ R_i.T
-    cos_theta = (torch.trace(R_rel) - 1) / 2
-    cos_theta = torch.clamp(cos_theta, -1.0, 1.0)
-    dR = torch.acos(cos_theta)
+def sigma_loss_teacher(feat_teacher, sigma):
+    """
+    feat_teacher: [N, V, C]  (DETACHED)
+    sigma:        [N, V, 1]
+    """
 
-    # 🔥 normalize（关键）
-    dt = dt / (dt.detach() + 1e-6)
-    dR = dR / (dR.detach() + 1e-6)
+    # --- 1. teacher variance ---
+    with torch.no_grad():
+        var = cosine_variance(feat_teacher)  # [N]
 
-    return dt + dR
+        # normalize（很重要）
+        var = (var - var.min()) / (var.max() - var.min() + 1e-6)
 
+    # --- 2. student prediction ---
+    sigma_point = sigma.squeeze(-1).mean(dim=1)  # [N]
+
+    # --- 3. regression loss ---
+    loss = F.mse_loss(sigma_point, var)
+
+    return loss
+
+"""
+def sigma_loss(kpnet, f_geo, sigma, T_list, batch_idx):
+    
+    #f_geo: [N, V, C]
+    #sigma: [N, V, 1]
+    #ranking loss: all points pairwise, no random sampling
+    
+    device = f_geo.device
+    N, V, C = f_geo.shape
+
+    # 1. compute multi-view error per point
+    error_list = []
+
+    for i in range(V):
+        for j in range(V):
+            if i == j:
+                continue
+
+            T_i = T_list[i][batch_idx]
+            T_j = T_list[j][batch_idx]
+
+            f_i = f_geo[:, i, :]  # [N,C]
+            f_j = f_geo[:, j, :]  # [N,C]
+
+            pred_j = kpnet.transform_geo(f_i, T_i, T_j)
+
+            # detach to avoid gradient through error itself
+            err = ((pred_j.detach() - f_j.detach()) ** 2).mean(dim=1)  # [N]
+
+            error_list.append(err)
+
+    # [N, num_pairs]
+    error = torch.stack(error_list, dim=1).mean(dim=1)  # [N]
+
+    # 2. aggregate sigma per point (average across views)
+    sigma_point = sigma.squeeze(-1).mean(dim=1)  # [N]
+
+    # 3. full pairwise ranking loss
+    # 构建 pairwise matrix
+    diff_sigma = sigma_point.unsqueeze(0) - sigma_point.unsqueeze(1)  # [N,N]
+    diff_error = error.unsqueeze(0) - error.unsqueeze(1)                # [N,N]
+
+    target = (diff_error > 0).float()  # 如果 error_i > error_j, target=1
+
+    # 排除对角线（i==j）
+    mask = 1 - torch.eye(N, device=device)
+    loss_rank = F.binary_cross_entropy_with_logits(
+        diff_sigma * mask,
+        target * mask
+    )
+
+    # 4. multi-view consistency
+    loss_cons = 0.0
+    count = 0
+    for i in range(V):
+        for j in range(V):
+            if i == j: continue
+            loss_cons += (sigma[:, i] - sigma[:, j]).abs().mean()
+            count += 1
+    loss_cons = loss_cons / count if count > 0 else 0.0
+
+    # 5. anti-collapse
+    loss_reg = sigma_point.mean()
+
+    # 6. final
+    loss = loss_rank + 0.1 * loss_cons + 0.05 * loss_reg
+    return loss
+"""
 
 def geo_loss(kpnet, f_geo, T_list, batch_idx):
     """
@@ -138,6 +186,10 @@ def geo_loss(kpnet, f_geo, T_list, batch_idx):
 
             # --- transform ---
             pred_j = kpnet.transform_geo(f_i, T_i, T_j)
+            
+            # --- normalize (optional) ---
+            pred_j = F.normalize(pred_j, dim=1)
+            f_j = F.normalize(f_j, dim=1)
 
             # --- loss ---
             loss += F.mse_loss(pred_j, f_j.detach())
@@ -146,86 +198,7 @@ def geo_loss(kpnet, f_geo, T_list, batch_idx):
 
     return loss / count if count > 0 else torch.tensor(0.0, device=f_geo.device)
 
-def geo_cycle_loss(kpnet, f_geo, T_list, batch_idx):
-    """
-    Cycle-consistent geometry loss
 
-    f_geo: [N, V, C]
-    T_list: list of [B,4,4]
-    """
-
-    N, V, C = f_geo.shape
-    loss = 0.0
-    count = 0
-
-    for i in range(V):
-        for j in range(V):
-            for k in range(V):
-
-                if i == j or j == k or i == k:
-                    continue
-
-                # --- poses ---
-                T_i = T_list[i][batch_idx]
-                T_j = T_list[j][batch_idx]
-                T_k = T_list[k][batch_idx]
-
-                # --- features ---
-                f_i = f_geo[:, i, :]  # [N,C]
-
-                # i → j
-                f_j = kpnet.transform_geo(f_i, T_i, T_j)
-
-                # j → k
-                f_k = kpnet.transform_geo(f_j, T_j, T_k)
-
-                # k → i
-                f_i_cycle = kpnet.transform_geo(f_k, T_k, T_i)
-
-                # --- cycle loss ---
-                loss += F.mse_loss(f_i_cycle, f_i.detach())
-
-                count += 1
-
-    return loss / count if count > 0 else torch.tensor(0.0, device=f_geo.device)
-
-def recon_loss(kpnet, f_inv, f_geo, f_app, shared):
-    N, V, C = f_inv.shape
-    loss = 0
-    count = 0
-    for v in range(V):
-        pred = kpnet.reconstruct_feature(f_inv[:, v, :], f_geo[:, v, :], f_app[:, v, :])
-        loss += F.mse_loss(pred, shared[:, v, :].detach())
-        count += 1
-    return loss / count
-
-def cross_view_loss(kpnet, f_inv, f_geo, f_app, shared, T_list, batch_idx):
-
-    N, V, C = f_inv.shape
-    loss = 0
-    count = 0
-
-    for i in range(V):
-        for j in range(V):
-            if i == j:
-                continue
-
-            # ✅ 只取当前 batch 的 pose
-            T_i = T_list[i][batch_idx]  # [4,4]
-            T_j = T_list[j][batch_idx]  # [4,4]
-
-            pred,_ = kpnet.predict_view(
-                f_inv[:, i, :],
-                f_geo[:, i, :],
-                f_app[:, i, :],
-                T_i,
-                T_j
-            )
-
-            loss += F.mse_loss(pred, shared[:, j, :].detach())
-            count += 1
-
-    return loss / count
 
 def reliability_loss(rel_pred, f_inv):
     """
