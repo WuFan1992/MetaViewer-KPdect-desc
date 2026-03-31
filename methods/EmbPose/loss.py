@@ -69,25 +69,36 @@ def cosine_variance(feat):
 
     return var / count
 
-def sigma_loss_teacher(feat_teacher, sigma):
+def sigma_loss_teacher_multi_view(feat_teacher, sigma_pred):
     """
-    feat_teacher: [N, V, C]  (DETACHED)
-    sigma:        [N, V, 1]
+    Multi-view cosine variance loss for sigma supervision.
+
+    Args:
+        feat_teacher: [N, V, C] backbone features for N points, V views
+                      detached from backbone (no grad)
+        sigma_pred:   [N, V, 1] predicted sigma from network
+
+    Returns:
+        loss: MSE loss between predicted sigma and multi-view variance
     """
+    N, V, C = feat_teacher.shape
+    # 1. normalize features
+    f_norm = F.normalize(feat_teacher, dim=-1)  # [N,V,C]
 
-    # --- 1. teacher variance ---
-    with torch.no_grad():
-        var = cosine_variance(feat_teacher)  # [N]
+    # 2. compute pairwise cosine similarity between views
+    cos_sim = torch.einsum('nvc,nwc->nvw', f_norm, f_norm)  # [N,V,V]
 
-        # normalize（很重要）
-        var = (var - var.min()) / (var.max() - var.min() + 1e-6)
+    # 3. compute variance per view: 1 - mean similarity
+    cos_var = 1 - cos_sim.mean(dim=2)  # [N,V]
 
-    # --- 2. student prediction ---
-    sigma_point = sigma.squeeze(-1).mean(dim=1)  # [N]
+    # 4. normalize variance (zero mean, unit std) per point
+    cos_var = (cos_var - cos_var.mean(dim=1, keepdim=True)) / (cos_var.std(dim=1, keepdim=True) + 1e-6)
 
-    # --- 3. regression loss ---
-    loss = F.mse_loss(sigma_point, var)
+    # 5. flatten sigma_pred
+    sigma_flat = sigma_pred.squeeze(-1)  # [N,V]
 
+    # 6. MSE loss
+    loss = F.mse_loss(sigma_flat, cos_var.detach())
     return loss
 
 """

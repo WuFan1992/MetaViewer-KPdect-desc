@@ -237,15 +237,14 @@ class TrainerMultiView:
                
             
              # ===== forward each view =====             
-            f_inv_maps, f_geo_maps, sigma_maps, feat_teacher_maps = [], [], [], []
+            f_inv_maps, f_geo_maps, sigma_maps = [], [], []
             for v in range(V):
-                out = self.kpnet(images[v].to(self.device))
+                out = self.kpnet(images[v].to(self.device), return_teacher= True)
                 f_inv_maps.append(out["f_inv"])
                 f_geo_maps.append(out["f_geo"])
                 sigma_maps.append(out["sigma"])
-                feat_teacher_maps.append(out["feat_teacher"])  # 🔥 新增
             # ===== sample multi-view features =====
-            f_inv_list, f_geo_list, sigma_list, feat_teacher_list = [], [], [], []
+            f_inv_list, f_geo_list, sigma_list, feat_teacher_list= [], [], [], []
 
             for b in range(B):
                 corrs = multi_corrs[b]  # [N,V,2]
@@ -270,7 +269,10 @@ class TrainerMultiView:
                     f_inv_sample = sample_map_at_coords(f_inv_maps[v][b:b+1], coords, H_orig, W_orig)
                     f_geo_sample = sample_map_at_coords(f_geo_maps[v][b:b+1], coords, H_orig, W_orig)
                     sigma_sample = sample_map_at_coords(sigma_maps[v][b:b+1], coords, H_orig, W_orig)
-                    feat_teacher_sample = sample_map_at_coords(feat_teacher_maps[v][b:b+1],coords,H_orig,W_orig)
+                    # teacher feature 直接使用 backbone 输出，detach
+                    feat_teacher_sample = self.kpnet.backbone(images[v].to(self.device)).detach()
+                    feat_teacher_sample = sample_map_at_coords(feat_teacher_sample[b:b+1], coords, H_orig, W_orig)
+                   
 
                     f_inv_per_point.append(f_inv_sample)
                     f_geo_per_point.append(f_geo_sample)
@@ -283,12 +285,11 @@ class TrainerMultiView:
                 f_inv = torch.stack(f_inv_per_point, dim=1)   # [N,V,C]
                 f_geo = torch.stack(f_geo_per_point, dim=1)
                 sigma = torch.stack(sigma_per_point, dim=1)
-                feat_teacher = torch.stack(feat_teacher_per_point, dim=1)  # [N,V,C]
                 
                 f_inv_list.append(f_inv)
                 f_geo_list.append(f_geo)
                 sigma_list.append(sigma)
-                feat_teacher_list.append(feat_teacher)
+                feat_teacher_list.append(torch.stack(feat_teacher_per_point, dim=1))
 
 
             if len(f_inv_list) == 0:
@@ -307,7 +308,7 @@ class TrainerMultiView:
                 f_inv = f_inv_list[b]
                 f_geo = f_geo_list[b]
                 sigma = sigma_list[b]
-                
+                feat_teacher = feat_teacher_list[b]
 
     
                 if f_inv.shape[0] == 0:
@@ -318,26 +319,25 @@ class TrainerMultiView:
                 
 
                 # geometry loss
-                T_list = [T.to(self.device, dtype=torch.float) for T in batch_data['T']]
-                loss_geo_b = geo_loss(self.kpnet, f_geo, T_list, batch_idx=b)
+                #T_list = [T.to(self.device, dtype=torch.float) for T in batch_data['T']]
+                #loss_geo_b = geo_loss(self.kpnet, f_geo, T_list, batch_idx=b)
                 
                 # variance loss
-                feat_teacher = feat_teacher_list[b]
-                loss_sigma_b = sigma_loss_teacher(feat_teacher, sigma)
+                loss_sigma_b = sigma_loss_teacher_multi_view(feat_teacher, sigma)
                 
 
 
                 # accumulate
                 loss_desc_total += loss_desc_b
                 loss_sigma_total += loss_sigma_b
-                loss_geo_total += loss_geo_b
+                #loss_geo_total += loss_geo_b
                 valid_batch += 1
 
             # normalize
             if valid_batch > 0:
                 loss_desc = loss_desc_total / valid_batch
                 loss_sigma = loss_sigma_total / valid_batch
-                loss_geo = loss_geo_total / valid_batch
+                #loss_geo = loss_geo_total / valid_batch
                 
                 
             else:
@@ -348,13 +348,13 @@ class TrainerMultiView:
             # -------------------------
             # weights
             # -------------------------
-            w_geo = min(0.3, max(0.0, (iter_idx - 5000) / 10000))
+            #w_geo = min(0.3, max(0.0, (iter_idx - 5000) / 10000))
             w_sigma = 1.0
 
             # -------------------------
             # final loss
             # -------------------------
-            loss = loss_desc + w_sigma * loss_sigma + w_geo * loss_geo
+            loss = loss_desc + w_sigma * loss_sigma # + w_geo * loss_geo
 
             ######################
             """
@@ -376,7 +376,7 @@ class TrainerMultiView:
                 f"loss:{loss.item():.4f} "
                 f"desc:{loss_desc.item():.4f} "
                 f"sigma:{loss_sigma.item():.4f} "       # dual-softmax probability loss
-                f"geo:{loss_geo.item():.4f} "       # geometric / variant descriptor reconstruction 
+                #f"geo:{loss_geo.item():.4f} "       # geometric / variant descriptor reconstruction 
             )       
             
             # 10. 定期保存 checkpoint
@@ -391,7 +391,7 @@ class TrainerMultiView:
             self.writer.add_scalar('Loss/total', loss.item(), iter_idx)
             self.writer.add_scalar('Loss/description', loss_desc.item(), iter_idx)   # descriptor Mahalanobis
             self.writer.add_scalar('Loss/sigma', loss_sigma.item(), iter_idx)     # dual-softmax probability loss
-            self.writer.add_scalar('Loss/geo', loss_geo.item(), iter_idx)     # geometric / variant descriptor reconstruction
+            #self.writer.add_scalar('Loss/geo', loss_geo.item(), iter_idx)     # geometric / variant descriptor reconstruction
 
 
 

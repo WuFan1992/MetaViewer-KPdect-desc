@@ -186,26 +186,22 @@ class TripleDescriptorHead(nn.Module):
 
 
 # -------------------------
-# Variance Head
+# Variance Branch (Teacher-Student)
 # -------------------------
-
-class UncertaintyHead(nn.Module):
-    def __init__(self, in_dim=32):  # 🔥 改成 geo dim
+class VarianceHead(nn.Module):
+    def __init__(self, feat_dim=128):
         super().__init__()
-
         self.net = nn.Sequential(
-            nn.Conv2d(in_dim, 64, 3, padding=1),
+            nn.Conv2d(feat_dim, 64, 3, padding=1),
             nn.ReLU(),
-            nn.Conv2d(64, 1, 1)
+            nn.Conv2d(64, 1, 1),
+            nn.Sigmoid()   # output [0,1]
         )
 
-    def forward(self, f_geo):
-        log_sigma = self.net(f_geo)
-
-        # 🔥 bounded sigma（防爆）
-        sigma = torch.sigmoid(log_sigma)
-
-        return sigma
+    def forward(self, feat_teacher):
+        # feat_teacher: [B,C,H,W]
+        sigma_pred = self.net(feat_teacher)
+        return sigma_pred
 
 
 # -------------------------
@@ -297,27 +293,31 @@ class VUDNet(nn.Module):
             dim_app=dim_app
         )
 
-        # uncertainty（保留）
-        self.uncertainty_head = UncertaintyHead(dim_geo)
-
         # pose + geometry
         self.pose_encoder = PoseEncoder(pose_dim, pose_embed)
         self.geo_transform = GeometryTransform(dim_geo, pose_embed)
+        
+        # independent variance branch (teacher-student)
+        self.variance_branch = VarianceHead(feature_dim)
 
-    def forward(self, img):
+    def forward(self, img, return_teacher=False):
 
-        shared = self.backbone(img)
+        shared_feat = self.backbone(img)
 
-        f_inv, f_geo, f_app = self.encoder(shared)
+        f_inv, f_geo, _ = self.encoder(shared_feat)
 
-        sigma = self.uncertainty_head(f_geo)
+        out = {
+            "f_inv": f_inv,
+            "f_geo": f_geo,
+        }
 
-        return {
-        "f_inv": f_inv,
-        "f_geo": f_geo,
-        "sigma": sigma,
-        "feat_teacher": shared.detach()   # 🔥 新增（关键）
-        }   
+        if return_teacher:
+            # teacher feature for variance head (detach to avoid grad to backbone)
+            feat_teacher = shared_feat.detach()
+            sigma_pred = self.variance_branch(feat_teacher)
+            out["sigma"] = sigma_pred
+
+        return out
 
     def transform_geo(self, f_geo, T_i, T_j):
 
