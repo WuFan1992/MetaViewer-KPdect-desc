@@ -88,7 +88,7 @@ def generate_exclusive_subsets(batch_data, subset_views_list=[5,4,3,2], scale=4)
     all_ids = batch_data['all_5view_ids']
     if isinstance(all_ids, torch.Tensor):
         all_ids = all_ids.cpu().numpy().flatten().tolist()
-    all_ids = [int(x.item()) if isinstance(x, torch.Tensor) else int(x) for x in all_ids]
+    all_ids = [int(x) if not isinstance(x, int) else x for x in all_ids]
     id_to_idx = {vid: i for i, vid in enumerate(all_ids)}
 
     batch_points_dict = {}
@@ -107,11 +107,14 @@ def generate_exclusive_subsets(batch_data, subset_views_list=[5,4,3,2], scale=4)
                 scale=scale,
                 used_points=used_points
             )
+           # 如果返回为空，则给空数组
+            if multi_corrs_k is None or multi_corrs_k.shape[0] == 0:
+                subset_ids, multi_corrs_k, vis_k = [], np.zeros((0, k, 2)), None
+            else:
+                # 强制 subset_ids 全部为 Python int
+                subset_ids = [int(x) if not isinstance(x, int) else x for x in subset_ids]
+
             batch_points_dict[k] = (subset_ids, (multi_corrs_k, vis_k))
-            # 更新已使用点索引
-            if multi_corrs_k.shape[0] > 0:
-                # 将索引按 global offset 累加，保证下一轮不重复
-                used_points.update([len(used_points) + i for i in range(multi_corrs_k.shape[0])])
 
     return batch_points_dict, id_to_idx
 

@@ -243,6 +243,9 @@ class TrainerMultiView:
     def train_iters(self):
         self.kpnet.train()
         data_iter = iter(self.data_loader)
+        
+        # ✅ 定义子集视图顺序
+        subset_views_list = [5, 4, 3, 2]
 
         for iter_idx in range(self.num_iters):
             try:
@@ -258,7 +261,8 @@ class TrainerMultiView:
             batch_points_dict, id_to_idx = generate_exclusive_subsets(batch_data)
 
             # ===== 可视化 =====
-            visualize_multi_view_matches(batch_data, batch_points_dict, id_to_idx)
+            #visualize_multi_view_matches(batch_data, batch_points_dict, id_to_idx)
+            
             # ===== 3. forward 每个 view =====
             V = len(images)
             f_inv_maps, f_geo_maps, sigma_maps = [], [], []
@@ -271,57 +275,82 @@ class TrainerMultiView:
             var_weights = {5:1.0, 4:0.7, 3:0.4, 2:0.1}
             desc_weights = {5:1.0, 4:1.0, 3:1.0, 2:1.0}
             loss_desc_total, loss_sigma_total, valid_batch = 0.0, 0.0, 0
+            valid_sigma_batch = 0
 
             for k in subset_views_list:
-                corrs_list = batch_points_dict[k]
-                if len(corrs_list) == 0:
+                subset_ids, (corrs_k, vis_k) = batch_points_dict[k]
+                N_points = corrs_k.shape[0]
+
+                if N_points < 20:
                     continue
+                
+                 # ===== 限制最大点数 =====
+                max_points = 5000
+                if N_points > max_points:
+                    idx = torch.randperm(N_points)[:max_points]
+                    corrs_k = corrs_k[idx]
+                    vis_k = vis_k[idx]
 
-                for b in range(len(corrs_list)):
-                    corrs = corrs_list[b]  # [N_points, k, 2]
-                    N = corrs.shape[0]
-                    if N < 20:
-                        continue
+                # ===== 采样 multi-view 特征 =====
+                f_inv_per_point, sigma_per_point, feat_teacher_per_point = [], [], []
+                
+                for v in range(k):
+                    coords = corrs_k[:, v, :].to(self.device)
+                    # 采样描述子
+                    f_inv_sample = sample_map_at_coords(f_inv_maps[v], coords, H_orig, W_orig)
+                    sigma_sample = sample_map_at_coords(sigma_maps[v], coords, H_orig, W_orig)
+                    
+                    # teacher feature 
+                    feat_teacher_map = self.kpnet.backbone.forward_xfeat(images[v].to(self.device))
+                    feat_teacher_sample = sample_map_at_coords(feat_teacher_map, coords, H_orig, W_orig)
 
-                    max_points = 5000
-                    if N > max_points:
-                        idx = torch.randperm(N)[:max_points]
-                        corrs = corrs[idx]
+                    f_inv_per_point.append(f_inv_sample)
+                    sigma_per_point.append(sigma_sample)
+                    feat_teacher_per_point.append(feat_teacher_sample)
 
-                    # ===== 采样 multi-view 特征 =====
-                    f_inv_per_point, sigma_per_point, feat_teacher_per_point = [], [], []
-                    for v in range(k):
-                        coords = corrs[:, v, :].to(self.device)
-                        f_inv_sample = sample_map_at_coords(f_inv_maps[v][b:b+1], coords, H_orig, W_orig)
-                        sigma_sample = sample_map_at_coords(sigma_maps[v][b:b+1], coords, H_orig, W_orig)
-                        feat_teacher_map = self.kpnet.backbone(images[v].to(self.device)).detach()
-                        feat_teacher_sample = sample_map_at_coords(feat_teacher_map[b:b+1], coords, H_orig, W_orig)
+                # stack → [N_points, k, C]
+                f_inv = torch.stack(f_inv_per_point, dim=1)
+                sigma = torch.stack(sigma_per_point, dim=1)
+                feat_teacher = torch.stack(feat_teacher_per_point, dim=1)
+                
+                 # ===== visibility mask =====
+                if vis_k is None:
+                    visibility = torch.ones((N_points, k), device=self.device, dtype=torch.bool)
+                else:
+                    visibility = vis_k.bool().to(self.device)
 
-                        f_inv_per_point.append(f_inv_sample)
-                        sigma_per_point.append(sigma_sample)
-                        feat_teacher_per_point.append(feat_teacher_sample)
+                # ===== 计算 multi-view loss =====
+                loss_desc_b = mv_infonce_masked(f_inv, visibility)
+                #loss_sigma_b = sigma_loss_teacher_multi_view_masked(feat_teacher, sigma, visibility)
 
-                    # stack → [N_points, k, C]
-                    f_inv = torch.stack(f_inv_per_point, dim=1)
-                    sigma = torch.stack(sigma_per_point, dim=1)
-                    feat_teacher = torch.stack(feat_teacher_per_point, dim=1)
-
-                    # ===== 计算 multi-view loss =====
-                    loss_desc_b = mv_infonce_masked(f_inv, torch.ones((N, k), device=self.device))
-                    loss_sigma_b = sigma_loss_teacher_multi_view_masked(feat_teacher, sigma, torch.ones((N, k), device=self.device))
-
-                    loss_desc_total += desc_weights[k] * loss_desc_b
+                loss_desc_total += desc_weights[k] * loss_desc_b
+                
+                
+                ###########################
+                # ✅ 只在 k == 5 时训练 variance
+                if k == 5:
+                    loss_sigma_b = sigma_loss_teacher_multi_view_masked(feat_teacher, sigma, visibility)
                     loss_sigma_total += var_weights[k] * loss_sigma_b
-                    valid_batch += 1
+                    valid_sigma_batch += 1
+                
+                #############################
+                #loss_sigma_total += var_weights[k] * loss_sigma_b
+                valid_batch += 1
 
             # ===== 5. normalize + backward =====
             if valid_batch > 0:
                 loss_desc = loss_desc_total / valid_batch
-                loss_sigma = loss_sigma_total / valid_batch
+                #loss_sigma = loss_sigma_total / valid_batch
+                #loss_sigma  = loss_sigma_total
             else:
-                dummy = 0.0 * next(self.kpnet.parameters()).sum()
+                dummy = torch.tensor(0.0, device=self.device, requires_grad=True)
                 loss_desc = dummy
-                loss_sigma = dummy
+                #loss_sigma = dummy
+                
+            if valid_sigma_batch > 0:
+                loss_sigma = loss_sigma_total / valid_sigma_batch
+            else:
+                loss_sigma = torch.tensor(0.0, device=self.device, requires_grad=True)
 
             loss = loss_desc + 1.0 * loss_sigma
             loss.backward()

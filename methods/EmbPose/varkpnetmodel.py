@@ -120,31 +120,30 @@ class SharedBackbone_XFeat(nn.Module):
     def __init__(self, out_dim=128, freeze=True):
         super().__init__()
 
-        # 初始化 XFeat
-        self.xfeat = XFeat()  # 如果有预训练权重可以加载
+        self.xfeat = XFeat()
         self.out_dim = out_dim
 
-        # XFeat 输出是 [B, 64, H/8, W/8]，proj + 上采样到 H/4, W/4
         self.proj = nn.Sequential(
             nn.Conv2d(64, out_dim, 1),
             nn.GroupNorm(8, out_dim),
             nn.ReLU(inplace=True)
         )
 
-        # 是否冻结 XFeat backbone
         if freeze:
             for p in self.xfeat.parameters():
                 p.requires_grad = False
 
     def forward(self, x):
-        # x: [B,3,H,W]
-
         feat = self.xfeat.getFeatDesc(x)  # [B,64,H/8,W/8]
-
-        feat = self.proj(feat)               # [B,out_dim,H/8,W/8]
-        # 上采样到 H/4, W/4
+        feat = self.proj(feat)
         feat = F.interpolate(feat, scale_factor=2, mode='bilinear', align_corners=False)
+        return feat
 
+    # ✅ 新增：纯 XFeat（teacher 用）
+    def forward_xfeat(self, x):
+        with torch.no_grad():
+            feat = self.xfeat.getFeatDesc(x)  # [B,64,H/8,W/8]
+            feat = F.interpolate(feat, scale_factor=2, mode='bilinear', align_corners=False)
         return feat
 
 
@@ -306,18 +305,17 @@ class VUDNet(nn.Module):
 
         f_inv, f_geo, _ = self.encoder(shared_feat)
 
-        out = {
+        # ✅ 用 XFeat 做 sigma 输入
+        xfeat_feat = self.backbone.forward_xfeat(img)
+
+        sigma_pred = self.variance_branch(xfeat_feat)
+
+        return {
             "f_inv": f_inv,
             "f_geo": f_geo,
+            "sigma": sigma_pred,
         }
 
-        if return_teacher:
-            # teacher feature for variance head (detach to avoid grad to backbone)
-            feat_teacher = shared_feat.detach()
-            sigma_pred = self.variance_branch(feat_teacher)
-            out["sigma"] = sigma_pred
-
-        return out
 
     def transform_geo(self, f_geo, T_i, T_j):
 
