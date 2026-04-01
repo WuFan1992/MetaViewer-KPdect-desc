@@ -1,33 +1,7 @@
 import torch
 from kornia.utils import create_meshgrid
-import pdb
+import numpy as np
 
-from collections import defaultdict
-def split_points_by_visibility(multi_corrs, min_views=(2,3,4,5)):
-    """
-    将 multi_corrs 按照可见 view 数拆分
-    Args:
-        multi_corrs: list of dicts, each dict has:
-            'points': [N, 5, 2]
-            'visibility': [N, 5] bool
-        min_views: tuple of int, e.g. (2,3,4,5)
-    Returns:
-        batch_points_dict: dict k -> list of (points, vis)
-    """
-    batch_points_dict = {k: [] for k in min_views}
-
-    for b, data_b in enumerate(multi_corrs):
-        pts = data_b['points']      # [N,5,2]
-        vis = data_b['visibility']  # [N,5] bool
-
-        num_vis = vis.sum(dim=1)    # [N] 每个点可见 view 数
-
-        for k in min_views:
-            mask = (num_vis == k)
-            if mask.sum() > 0:
-                batch_points_dict[k].append( (pts[mask], vis[mask]) )
-
-    return batch_points_dict
 
 @torch.no_grad()
 def warp_kpts(kpts0, depth0, depth1, T_0to1, K0, K1):
@@ -96,7 +70,7 @@ def warp_kpts(kpts0, depth0, depth1, T_0to1, K0, K1):
     valid_mask = nonzero_mask #* consistent_mask* covisible_mask 
 
     return valid_mask, w_kpts0
-
+"""
 @torch.no_grad()
 def spvs_coarse_multi_cycle(data, scale=8, cycle_thresh=1.5):
     device = data['images'][0].device
@@ -181,7 +155,7 @@ def spvs_coarse_multi_cycle(data, scale=8, cycle_thresh=1.5):
         })
 
     return multi_corrs_batch
-
+"""
 """
 def spvs_coarse_multi_cycle(data, scale=8, cycle_thresh=1.5):
     
@@ -251,6 +225,133 @@ def spvs_coarse_multi_cycle(data, scale=8, cycle_thresh=1.5):
 
     return multi_corrs_batch  # list of length B, 每个元素 [num_points, 5, 2]
 """
+
+# ================================
+# 1️⃣ 生成完整 5-view 对应点
+# ================================
+@torch.no_grad()
+def generate_multi_corrs_from_data(data, scale=8, cycle_thresh=1.5):
+    """
+    从 data (5-view) 中生成 multi-view 对应点坐标。
+
+    Args:
+        data: dict, 包含 keys 'images', 'depths', 'Ks', 'T_0to', 'scales'
+              每个 key 是 list of length 5
+        scale: 下采样比例
+        cycle_thresh: cycle consistency 阈值
+
+    Returns:
+        multi_corrs: torch.Tensor, [num_points, 5, 2] 对应原图坐标
+    """
+    device = data['images'][0].device
+    B = 1  # 单个 scene
+
+    images = [img.unsqueeze(0) if img.dim()==3 else img for img in data['images']]
+    depths = [d.unsqueeze(0) if d.dim()==2 else d for d in data['depths']]
+    Ks = [K.unsqueeze(0) if K.dim()==2 else K for K in data['Ks']]
+    T_0to = [T.unsqueeze(0) if T.dim()==2 else T for T in data['T_0to']]
+    scales = [torch.tensor([s], device=device) if not isinstance(s, torch.Tensor) else s for s in data['scales']]
+
+    # ===== 1. reference grid =====
+    _, _, H, W = images[0].shape
+    h, w = H // scale, W // scale
+    grid = create_meshgrid(h, w, False, device).reshape(1, h*w, 2)
+    grid_i = grid * scale  # 原图坐标
+
+    valid_all = torch.ones((1, h*w), dtype=torch.bool, device=device)
+    all_points = [grid_i]
+
+    # ===== 2. cycle consistency =====
+    V = len(images)
+    for i in range(1, V):
+        valid_fw, warped_fw = warp_kpts(grid_i, depths[0], depths[i], T_0to[i], Ks[0], Ks[i])
+        T_i_to_0 = torch.inverse(T_0to[i])
+        valid_bw, warped_bw = warp_kpts(warped_fw, depths[i], depths[0], T_i_to_0, Ks[i], Ks[0])
+        dist = torch.norm(grid_i - warped_bw, dim=-1)
+        mask_cycle = dist < cycle_thresh
+        valid = valid_fw & valid_bw & mask_cycle
+        valid_all &= valid
+        all_points.append(warped_fw)
+
+    # ===== 3. final filtering =====
+    final_mask = valid_all[0]
+    if final_mask.sum() == 0:
+        empty_corrs = torch.empty((0, V, 2), device=device)
+        empty_vis = torch.empty((0, V), dtype=torch.bool, device=device)
+        return empty_corrs, empty_vis
+
+    pts = [p[0, final_mask] for p in all_points]
+    multi_corrs_5view = torch.stack(pts, dim=1)  # [num_points, 5, 2]
+
+    # ===== 4. scale 回原图 =====
+    for i in range(V):
+        multi_corrs_5view[:, i] /= scales[i][0]
+    
+    # ===== vis mask（所有点都有效）=====
+    vis = torch.ones(multi_corrs_5view.shape[:2], dtype=torch.bool, device=device)
+
+    return multi_corrs_5view, vis
+
+@torch.no_grad()
+def select_subset_and_recompute_multi_corrs(data_5view, subset_views=3, scale=4, cycle_thresh=1.5):
+    """
+    从5-view数据中随机选 subset_views 个 view，并重新生成 cycle-consistent 对应点。
+    保证 anchor view（view 0）总在 subset 中，避免空 tensor。
+    
+    Args:
+        data_5view: dict, 包含 'images', 'depths', 'Ks', 'T_0to', 'T', 'scales', 'all_5view_ids'
+        subset_views: int, 子集 view 数量
+        scale: int, 下采样比例
+        cycle_thresh: float, cycle-consistency 阈值
+    
+    Returns:
+        subset_ids: list, 选出的 view id
+        multi_corrs_list: list of tuple, [(multi_corrs, vis)]，multi_corrs: [N, V, 2], vis: [N, V]
+    """
+    import numpy as np
+    from copy import deepcopy
+    import torch
+
+    # 获取所有 view id
+    all_ids = data_5view['all_5view_ids']
+    if isinstance(all_ids, torch.Tensor):
+        all_ids = all_ids.cpu().numpy().flatten()
+    elif isinstance(all_ids, list):
+        all_ids = np.array(all_ids).flatten()
+    elif isinstance(all_ids, np.ndarray):
+        all_ids = all_ids.flatten()
+    else:
+        raise TypeError(f"Unsupported type for all_ids: {type(all_ids)}")
+
+    if subset_views > len(all_ids):
+        raise ValueError(f"subset_views={subset_views} > total views={len(all_ids)}")
+
+    # ===== 保证 anchor view（view 0）在子集中 =====
+    anchor_id = all_ids[0]
+    remaining_ids = [v for v in all_ids if v != anchor_id]
+    if subset_views == 1:
+        subset_ids = [anchor_id]
+    else:
+        subset_ids = [anchor_id] + list(np.random.choice(remaining_ids, subset_views-1, replace=False))
+
+    # 获取对应索引
+    subset_indices = [int(np.where(all_ids == v)[0][0]) for v in subset_ids]
+
+    # 构造子集 data
+    data_subset = deepcopy(data_5view)
+    for key in ['images', 'depths', 'Ks', 'T_0to', 'T', 'scales']:
+        data_subset[key] = [data_subset[key][i] for i in subset_indices]
+    data_subset['all_5view_ids'] = subset_ids
+
+    # ===== 重新生成 cycle-consistent 对应点 =====
+    multi_corrs_subset, vis_tensor = generate_multi_corrs_from_data(data_subset, scale=scale, cycle_thresh=cycle_thresh)  # [N, V, 2]
+
+    # vis 全为 True
+    #vis_tensor = torch.ones(multi_corrs_subset.shape[:2], dtype=torch.bool)
+
+    # 返回 list of tuple [(multi_corrs, vis)]
+    return subset_ids, (multi_corrs_subset, vis_tensor)
+
 """
     multi_coors: [N, 5, 2]
     N 是匹配点的数量
@@ -265,11 +366,15 @@ def spvs_coarse_multi_cycle(data, scale=8, cycle_thresh=1.5):
 
 """
 """
-counts = visibility.sum(dim=1)
+batch_5 = dataset[idx]  # 5-view 原始数据
 
-pts_2 = points[counts == 2]
-pts_3 = points[counts == 3]
-pts_4 = points[counts == 4]
-pts_5 = points[counts == 5]
+# 从5-view里随机选4-view，并重新计算对应点
+batch_4, multi_corrs_4 = select_subset_and_recompute_multi_corrs(batch_5, subset_views=4)
+
+# 从5-view里随机选3-view，并重新计算对应点
+batch_3, multi_corrs_3 = select_subset_and_recompute_multi_corrs(batch_5, subset_views=3)
+
+# 从5-view里随机选2-view，并重新计算对应点
+batch_2, multi_corrs_2 = select_subset_and_recompute_multi_corrs(batch_5, subset_views=2)
 
 """

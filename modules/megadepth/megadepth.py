@@ -127,28 +127,35 @@ class MegaDepthDataset(Dataset):
     def __len__(self):
         return len(self.pair_infos)
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx, subset_views=None):
+        """
+        subset_views: int, optional
+            如果为 None，返回 5-view。
+            如果为 4/3/2，则从采样到的 5-view 中随机选择 subset_views 个。
+        """
         (idx0, idx1), overlap_score, central_matches = self.pair_infos[idx % len(self)]
-        
-        anchor = idx0  # 或 idx1 都行
-        # 1.采样5张图
-        ids = self.sample_five_views(anchor)
-        
-        if ids is None:
-            return self.__getitem__(np.random.randint(len(self)))  # 重采样
-        
-        # 2. 读取5张图
-        images = []
-        depths = []
-        Ks = []
-        poses = []
-        scales = []
-        
+    
+        anchor = idx0
+        # 1. 先采样 5 张 view
+        ids_5 = self.sample_five_views(anchor)
+        if ids_5 is None:
+            return self.__getitem__(np.random.randint(len(self)), subset_views=subset_views)
+    
+        # 2. 如果需要子集，从5-view里随机选择
+        if subset_views is not None and subset_views < len(ids_5):
+            ids = list(np.random.choice(ids_5, subset_views, replace=False))
+            # 保证 anchor 一定在子集里
+            if anchor not in ids:
+                ids[0] = anchor
+        else:
+            ids = ids_5
+
+        # 3. 读取 images / depth / Ks / poses / scales
+        images, depths, Ks, poses, scales = [], [], [], [], []
 
         for i in ids:
             img_path = osp.join(self.root_dir, self.scene_info['image_paths'][i])
             image, mask, scale = read_megadepth_gray(img_path, self.img_resize, self.df, self.img_padding, None)
-
             images.append(image)
             scales.append(scale)
 
@@ -158,28 +165,28 @@ class MegaDepthDataset(Dataset):
                     pad_to=self.depth_max_size)
                 depths.append(depth)
 
-            K = torch.tensor(self.scene_info['intrinsics'][i], dtype=torch.float).reshape(3, 3)
-            Ks.append(K)
+            Ks.append(torch.tensor(self.scene_info['intrinsics'][i], dtype=torch.float).reshape(3, 3))
             poses.append(self.scene_info['poses'][i])
-            
+
+        # 4. 计算相对变换
         T0 = poses[0]
         T_0to = []
-
-        for i in range(5):
+        for i in range(len(poses)):
             Ti = poses[i]
             T = torch.tensor(np.matmul(Ti, np.linalg.inv(T0)), dtype=torch.float)[:4, :4]
             T_0to.append(T)
-        
+
         data = {
-            'images': images,     # list of 5 (1,H,W)
-            'depths': depths,     # list of 5 (H,W)
-            'Ks': Ks,             # list of 5 (3,3)
-            'T_0to': T_0to,       # list of 5 (4,4)
+            'images': images,
+            'depths': depths,
+            'Ks': Ks,
+            'T_0to': T_0to,
             'T': poses,
             'scales': scales,
             'dataset_name': 'MegaDepth',
             'scene_id': self.scene_id,
             'view_ids': ids,
+            'all_5view_ids': ids_5  # 可以保留完整5-view的信息
         }
-        return data   
+        return data
         

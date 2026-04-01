@@ -223,22 +223,36 @@ class TrainerMultiView:
             images = batch_data['images']
             H_orig, W_orig = images[0].shape[2:]
             
-            # ===== 1. 生成 multi-view 对应点 =====
-            multi_corrs = spvs_coarse_multi_cycle(batch_data, scale=4) # 这里的坐标已经返回原图尺寸下了
-            V = len(images)  # V 是每一个 batch 里面有多少个view, 默认是5
-            B = len(multi_corrs)  # B 是batch 数
+            # ===== 1. 生成完整 5-view 对应点 =====
+            multi_corrs_5view, vis_5view = generate_multi_corrs_from_data(batch_data, scale=4)
+            
+            # ===== 2. 对每个子集 view 重新计算对应点 =====
+            subset_views_list = [2,3,4,5]
+            batch_points_dict = {}
+            # ===== 所有 view 的 id（用于 k=5）=====
+            all_ids = batch_data['all_5view_ids']
+            if isinstance(all_ids, torch.Tensor):
+                all_ids = all_ids.cpu().numpy().flatten().tolist()
+                # ✅ 把 tensor([1513]) → 1513
+                all_ids = [int(x.item()) if isinstance(x, torch.Tensor) else int(x)for x in all_ids]
+            # ✅ 建立映射：view_id -> index
+            id_to_idx = {int(vid): i for i, vid in enumerate(all_ids)}
             
             
-            # ===== 2. 生成不同view 下的样本 =====
-            batch_points_dict = split_points_by_visibility(multi_corrs, min_views=(2,3,4,5))
-            # 权重
-            var_weights = {5:1.0, 4:0.7, 3:0.4, 2:0.1}  # variance loss
-            desc_weights = {5:1.0, 4:1.0, 3:1.0, 2:1.0}  # descriptor loss
+            for k in subset_views_list:
+                if k == 5:
+                    # ✅ 保持和其他 k 完全一致的结构
+                    batch_points_dict[5] = (all_ids, (multi_corrs_5view, vis_5view))
+                else:
+                    subset_ids, multi_corrs_k = select_subset_and_recompute_multi_corrs(
+                        batch_data, subset_views=k, scale=4, cycle_thresh=1.5)
+                    batch_points_dict[k] = (subset_ids, multi_corrs_k)
 
-            
+                    
             # ===== 3. 可视化=====
             # ===== 关键：正确取 batch 第一个样本 =====
             # ===== 可视化 =====
+            # ===== 可视化 multi-view correspondences =====
             images_vis = []
             for img in batch_data['images']:
                 if isinstance(img, torch.Tensor) and img.dim() == 4:
@@ -246,125 +260,84 @@ class TrainerMultiView:
                 else:
                     images_vis.append(img)
 
-            # ===== 对每种view分别画 =====
+            # 对每种 view 子集分别画
             for k in [5,4,3,2]:
-
-                if len(batch_points_dict[k]) == 0:
+                subset_ids, (corrs_k, vis_k) = batch_points_dict[k]
+                subset_ids = [int(x.item()) if isinstance(x, torch.Tensor) else int(x)for x in subset_ids]
+                if corrs_k.shape[0] == 0:
                     print(f"[VIS] No {k}-view points")
                     continue
 
-                # 只取 batch=0 的点用于可视化
-                corrs_k, vis_k = batch_points_dict[k][0]
+                # ✅ 关键修复：图像顺序必须和 corr 对齐
+                imgs_k = [images_vis[id_to_idx[i]] for i in subset_ids]
 
-                # 从 images 中取前 k 个 view
-                imgs_k = images[:k]
-                pts_k = corrs_k[:, :k, :]    # 对应 k 张图的点
-                vis_k = vis_k[:, :k]
+                if vis_k is not None:
+                    vis_k = vis_k.astype(bool) if isinstance(vis_k, np.ndarray) else vis_k.bool()
 
                 plot_multi_view_matches(
-                    imgs_k,
-                    pts_k,
-                    vis_k,
+                    images=imgs_k,
+                    multi_corrs=corrs_k,
+                    vis=vis_k,
                     max_points=50,
                     save_path=None
                 )
-            
-            
-               
-            
-             # ===== forward each view =====             
+            # ===== 3. forward 每个 view =====
+            V = len(images)
             f_inv_maps, f_geo_maps, sigma_maps = [], [], []
             for v in range(V):
-                out = self.kpnet(images[v].to(self.device), return_teacher= True)
+                out = self.kpnet(images[v].to(self.device), return_teacher=True)
                 f_inv_maps.append(out["f_inv"])
                 f_geo_maps.append(out["f_geo"])
                 sigma_maps.append(out["sigma"])
-            # ===== sample multi-view features =====
-            loss_desc_total = 0.0
-            loss_sigma_total = 0.0
-            valid_batch = 0
-            
-            for k in [2,3,4,5]:
-                w_var = var_weights[k]
-                w_desc = desc_weights[k]
-                if len(batch_points_dict[k]) == 0: # 相当于是batch
-                    # 这个 batch 没有 k-view 点，直接跳过
+
+            # ===== 4. 对每种 view 子集计算 loss =====
+            var_weights = {5:1.0, 4:0.7, 3:0.4, 2:0.1}
+            desc_weights = {5:1.0, 4:1.0, 3:1.0, 2:1.0}
+            loss_desc_total, loss_sigma_total, valid_batch = 0.0, 0.0, 0
+
+            for k in subset_views_list:
+                corrs_list = batch_points_dict[k]
+                if len(corrs_list) == 0:
                     continue
-  
-                for b in range(len(batch_points_dict[k])):
-                    corrs, vis = batch_points_dict[k][b]
 
-
-                    if corrs is None or corrs.shape[0] < 20:
+                for b in range(len(corrs_list)):
+                    corrs = corrs_list[b]  # [N_points, k, 2]
+                    N = corrs.shape[0]
+                    if N < 20:
                         continue
 
-                    # ===== 限制最大点数 =====
                     max_points = 5000
-                    N = corrs.shape[0]
                     if N > max_points:
                         idx = torch.randperm(N)[:max_points]
                         corrs = corrs[idx]
-                        vis = vis[idx]
-                    N = corrs.shape[0]
-                    
-                    print(" k = ", k, "N = ", N)
 
-                    # 找出至少有 2 个 view 都有效的点
-                    valid_mask_pts = vis.sum(dim=1) >= 2  # [N], True 表示至少 2 个 view 可用
-                    if valid_mask_pts.sum() == 0:
-                        continue
-
-                    corrs_valid = corrs[valid_mask_pts]  # [N_valid, V, 2]
-                    vis_valid = vis[valid_mask_pts]      # [N_valid, V]
-
+                    # ===== 采样 multi-view 特征 =====
                     f_inv_per_point, sigma_per_point, feat_teacher_per_point = [], [], []
-
-                    for v in range(V):
-                        valid_mask_view = vis_valid[:, v]  # [N_valid]
-                        if valid_mask_view.sum() == 0:
-                            # 该 view 没有有效点，填充零
-                            C = f_inv_maps[v].shape[1]
-                            f_inv_per_point.append(torch.zeros((valid_mask_pts.sum(), C), device=self.device))
-                            sigma_per_point.append(torch.zeros((valid_mask_pts.sum(), 1), device=self.device))
-                            feat_teacher_per_point.append(torch.zeros((valid_mask_pts.sum(), C), device=self.device))
-                            continue
-
-                        coords = corrs_valid[valid_mask_view, v, :].to(self.device)
+                    for v in range(k):
+                        coords = corrs[:, v, :].to(self.device)
                         f_inv_sample = sample_map_at_coords(f_inv_maps[v][b:b+1], coords, H_orig, W_orig)
                         sigma_sample = sample_map_at_coords(sigma_maps[v][b:b+1], coords, H_orig, W_orig)
                         feat_teacher_map = self.kpnet.backbone(images[v].to(self.device)).detach()
                         feat_teacher_sample = sample_map_at_coords(feat_teacher_map[b:b+1], coords, H_orig, W_orig)
 
-                        # scatter 回完整 N_valid
-                        C = f_inv_sample.shape[-1]
-                        full_f_inv = torch.zeros((valid_mask_pts.sum(), C), device=self.device)
-                        full_sigma = torch.zeros((valid_mask_pts.sum(), 1), device=self.device)
-                        full_teacher = torch.zeros((valid_mask_pts.sum(), C), device=self.device)
+                        f_inv_per_point.append(f_inv_sample)
+                        sigma_per_point.append(sigma_sample)
+                        feat_teacher_per_point.append(feat_teacher_sample)
 
-                        full_f_inv[valid_mask_view] = f_inv_sample
-                        full_sigma[valid_mask_view] = sigma_sample
-                        full_teacher[valid_mask_view] = feat_teacher_sample
-
-                        f_inv_per_point.append(full_f_inv)
-                        sigma_per_point.append(full_sigma)
-                        feat_teacher_per_point.append(full_teacher)
-
-                    # stack → [N_valid, V, C]
+                    # stack → [N_points, k, C]
                     f_inv = torch.stack(f_inv_per_point, dim=1)
                     sigma = torch.stack(sigma_per_point, dim=1)
                     feat_teacher = torch.stack(feat_teacher_per_point, dim=1)
 
-                    # 计算 multi-view loss
-                    loss_desc_b = mv_infonce_masked(f_inv, vis_valid)
-                    loss_sigma_b = sigma_loss_teacher_multi_view_masked(feat_teacher, sigma, vis_valid)
+                    # ===== 计算 multi-view loss =====
+                    loss_desc_b = mv_infonce_masked(f_inv, torch.ones((N, k), device=self.device))
+                    loss_sigma_b = sigma_loss_teacher_multi_view_masked(feat_teacher, sigma, torch.ones((N, k), device=self.device))
 
-                    loss_desc_total += w_desc * loss_desc_b
-                    loss_sigma_total += w_var * loss_sigma_b
+                    loss_desc_total += desc_weights[k] * loss_desc_b
+                    loss_sigma_total += var_weights[k] * loss_sigma_b
                     valid_batch += 1
-                    
-            # =========================
-            # normalize losses
-            # =========================
+
+            # ===== 5. normalize + backward =====
             if valid_batch > 0:
                 loss_desc = loss_desc_total / valid_batch
                 loss_sigma = loss_sigma_total / valid_batch
@@ -373,17 +346,7 @@ class TrainerMultiView:
                 loss_desc = dummy
                 loss_sigma = dummy
 
-            # =========================
-            # loss weights
-            # =========================
-            w_sigma = 1.0   # 可以后面做schedule
-
-            # =========================
-            # final loss
-            # =========================
-            loss = loss_desc + w_sigma * loss_sigma
-            
-            # backward
+            loss = loss_desc + 1.0 * loss_sigma
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.kpnet.parameters(), 1.0)
             self.optimizer.step()
