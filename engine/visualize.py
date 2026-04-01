@@ -86,31 +86,31 @@ def run_test(image_path, checkpoint_path, device="cuda"):
 
     # ===== 4. forward =====
     with torch.no_grad():
-        out = model(img_tensor)
+        out = model(img_tensor, return_teacher=True)
 
     # 👉 H/4, W/4
     var_map = out["sigma"][0,0].cpu().numpy()
-    rel_map = out["reliability"][0,0].cpu().numpy()
+    #rel_map = out["reliability"][0,0].cpu().numpy()
 
     print("var range:", var_map.min(), var_map.max())
-    print("rel range:", rel_map.min(), rel_map.max())
+    #print("rel range:", rel_map.min(), rel_map.max())
 
     # ===== 5. 构造 score =====
     # ⭐ 推荐：融合（最稳）
-    score_map = rel_map / (var_map + 1e-6)
+    #score_map = rel_map / (var_map + 1e-6)
 
     # ===== 6. NMS（低分辨率）=====
-    kpts = nms_2d(score_map, nms_radius=4, top_k=500)
+    #kpts = nms_2d(score_map, nms_radius=4, top_k=500)
 
     # ===== 7. 映射回原图 =====
-    kpts_up = upscale_keypoints(kpts, scale=4)
+    #kpts_up = upscale_keypoints(kpts, scale=4)
 
     # ===== 8. 可视化 =====
-    img_kpts = draw_keypoints(img, kpts_up, (0,255,0))
+    #img_kpts = draw_keypoints(img, kpts_up, (0,255,0))
 
     # ===== 9. heatmap（可选）=====
     var_vis = cv2.resize(var_map, (W, H))
-    rel_vis = cv2.resize(rel_map, (W, H))
+    #rel_vis = cv2.resize(rel_map, (W, H))
 
     # ===== 10. 显示 =====
     plt.figure(figsize=(18,5))
@@ -120,10 +120,10 @@ def run_test(image_path, checkpoint_path, device="cuda"):
     plt.imshow(img)
     plt.axis('off')
 
-    plt.subplot(1,4,2)
-    plt.title("Keypoints")
-    plt.imshow(img_kpts)
-    plt.axis('off')
+    #plt.subplot(1,4,2)
+    #plt.title("Keypoints")
+    #plt.imshow(img_kpts)
+    #plt.axis('off')
 
     plt.subplot(1,4,3)
     plt.title("Variance")
@@ -131,16 +131,18 @@ def run_test(image_path, checkpoint_path, device="cuda"):
     plt.colorbar()
 
     plt.subplot(1,4,4)
-    plt.title("Reliability")
-    plt.imshow(rel_vis, cmap='jet')
-    plt.colorbar()
+    #plt.title("Reliability")
+    #plt.imshow(rel_vis, cmap='jet')
+    #plt.colorbar()
 
     plt.show()
 
-    return kpts_up
+    #return kpts_up
+    return None
 
 if __name__ == "__main__":
-    #data_path = "datasets/MegaDepth_v1/0022/dense0/imgs/186069410_b743faece0_o.jpg"
-    data_path = "datasets/MegaDepth_v1/0022/dense0/imgs/8232974_61eb861d2c_o.jpg"
-    cpkt_save_path = "checkpoints/kpnet_iter_19999.pth"
+    data_path = "datasets/MegaDepth_v1/0022/dense0/imgs/186069410_b743faece0_o.jpg"
+    #data_path = "datasets/MegaDepth_v1/0022/dense0/imgs/8232974_61eb861d2c_o.jpg"
+    #data_path = "datasets/MegaDepth_v1/0022/dense0/imgs/frame-000413.color.png"
+    cpkt_save_path = "checkpoints/kpnet_iter_8999.pth"
     run_test(data_path, cpkt_save_path)

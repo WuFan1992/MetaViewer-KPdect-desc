@@ -149,6 +149,37 @@ def plot_multi_view_matches(images, multi_corrs, vis=None, max_points=50, save_p
         plt.close()
     else:
         plt.show(block=True)
+        
+def visualize_multi_view_matches(batch_data, batch_points_dict, id_to_idx):
+    """
+    可视化多视图匹配子集
+    """
+    images_vis = []
+    for img in batch_data['images']:
+        if isinstance(img, torch.Tensor) and img.dim() == 4:
+            images_vis.append(img[0])
+        else:
+            images_vis.append(img)
+
+    for k in sorted(batch_points_dict.keys(), reverse=True):
+        subset_ids, (corrs_k, vis_k) = batch_points_dict[k]
+        if corrs_k.shape[0] == 0:
+            print(f"[VIS] No {k}-view points")
+            continue
+
+        # 图像顺序和 subset 对齐
+        imgs_k = [images_vis[id_to_idx[i]] for i in subset_ids]
+
+        if vis_k is not None:
+            vis_k = vis_k.astype(bool) if isinstance(vis_k, np.ndarray) else vis_k.bool()
+
+        plot_multi_view_matches(
+            images=imgs_k,
+            multi_corrs=corrs_k,
+            vis=vis_k,
+            max_points=50,
+            save_path=None
+        )
     
 def sfm_collate_fn(batch):
     """
@@ -223,64 +254,11 @@ class TrainerMultiView:
             images = batch_data['images']
             H_orig, W_orig = images[0].shape[2:]
             
-            # ===== 1. 生成完整 5-view 对应点 =====
-            multi_corrs_5view, vis_5view = generate_multi_corrs_from_data(batch_data, scale=4)
-            
-            # ===== 2. 对每个子集 view 重新计算对应点 =====
-            subset_views_list = [2,3,4,5]
-            batch_points_dict = {}
-            # ===== 所有 view 的 id（用于 k=5）=====
-            all_ids = batch_data['all_5view_ids']
-            if isinstance(all_ids, torch.Tensor):
-                all_ids = all_ids.cpu().numpy().flatten().tolist()
-                # ✅ 把 tensor([1513]) → 1513
-                all_ids = [int(x.item()) if isinstance(x, torch.Tensor) else int(x)for x in all_ids]
-            # ✅ 建立映射：view_id -> index
-            id_to_idx = {int(vid): i for i, vid in enumerate(all_ids)}
-            
-            
-            for k in subset_views_list:
-                if k == 5:
-                    # ✅ 保持和其他 k 完全一致的结构
-                    batch_points_dict[5] = (all_ids, (multi_corrs_5view, vis_5view))
-                else:
-                    subset_ids, multi_corrs_k = select_subset_and_recompute_multi_corrs(
-                        batch_data, subset_views=k, scale=4, cycle_thresh=1.5)
-                    batch_points_dict[k] = (subset_ids, multi_corrs_k)
+             # ===== 生成互斥子集 =====
+            batch_points_dict, id_to_idx = generate_exclusive_subsets(batch_data)
 
-                    
-            # ===== 3. 可视化=====
-            # ===== 关键：正确取 batch 第一个样本 =====
             # ===== 可视化 =====
-            # ===== 可视化 multi-view correspondences =====
-            images_vis = []
-            for img in batch_data['images']:
-                if isinstance(img, torch.Tensor) and img.dim() == 4:
-                    images_vis.append(img[0])
-                else:
-                    images_vis.append(img)
-
-            # 对每种 view 子集分别画
-            for k in [5,4,3,2]:
-                subset_ids, (corrs_k, vis_k) = batch_points_dict[k]
-                subset_ids = [int(x.item()) if isinstance(x, torch.Tensor) else int(x)for x in subset_ids]
-                if corrs_k.shape[0] == 0:
-                    print(f"[VIS] No {k}-view points")
-                    continue
-
-                # ✅ 关键修复：图像顺序必须和 corr 对齐
-                imgs_k = [images_vis[id_to_idx[i]] for i in subset_ids]
-
-                if vis_k is not None:
-                    vis_k = vis_k.astype(bool) if isinstance(vis_k, np.ndarray) else vis_k.bool()
-
-                plot_multi_view_matches(
-                    images=imgs_k,
-                    multi_corrs=corrs_k,
-                    vis=vis_k,
-                    max_points=50,
-                    save_path=None
-                )
+            visualize_multi_view_matches(batch_data, batch_points_dict, id_to_idx)
             # ===== 3. forward 每个 view =====
             V = len(images)
             f_inv_maps, f_geo_maps, sigma_maps = [], [], []
@@ -289,7 +267,6 @@ class TrainerMultiView:
                 f_inv_maps.append(out["f_inv"])
                 f_geo_maps.append(out["f_geo"])
                 sigma_maps.append(out["sigma"])
-
             # ===== 4. 对每种 view 子集计算 loss =====
             var_weights = {5:1.0, 4:0.7, 3:0.4, 2:0.1}
             desc_weights = {5:1.0, 4:1.0, 3:1.0, 2:1.0}
