@@ -85,44 +85,64 @@ def cosine_variance(feat):
 
     return var / count
 
-def sigma_loss_teacher_multi_view_masked(feat_teacher, sigma_pred, visibility):
+def sigma_loss_teacher_multi_view_masked(feat_teacher_list, sigma_list, visibility_list, var_weights=None, device=None):
     """
-    feat_teacher: [N,V,C]
-    sigma_pred: [N,V,1]
-    visibility: [N,V]
+    feat_teacher_list: list of [N, V, C]
+    sigma_list: list of [N, V, 1]
+    visibility_list: list of [N, V] (bool)
+    var_weights: dict {k: weight}
+    device: torch device
     """
-    f_norm = F.normalize(feat_teacher, dim=-1)
+    if var_weights is None:
+        var_weights = {5:1.0, 4:0.7, 3:0.5, 2:0.3}
 
-    cos_sim = torch.einsum('nvc,nwc->nvw', f_norm, f_norm)  # [N,V,V]
+    if device is None:
+        # 如果列表为空，默认使用 CPU
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    loss = 0
-    count = 0
+    total_loss = 0.0
+    total_count = 0
 
-    V = feat_teacher.shape[1]
+    for idx, feat_teacher in enumerate(feat_teacher_list):
+        sigma_pred = sigma_list[idx]
+        visibility = visibility_list[idx]
 
-    for i in range(V):
-        for j in range(i+1, V):
-            mask = visibility[:, i] & visibility[:, j]
+        N, V, C = feat_teacher.shape
+        f_norm = F.normalize(feat_teacher, dim=-1)
+        cos_sim = torch.einsum('nvc,nwc->nvw', f_norm, f_norm)
 
-            if mask.sum() < 10:
-                continue
+        k = V
+        weight = var_weights.get(k, 1.0)
 
-            sim = cos_sim[mask, i, j]
+        loss_subset = 0.0
+        count_subset = 0
 
-            var_target = 1 - sim
+        for i in range(V):
+            for j in range(i+1, V):
+                mask = visibility[:, i] & visibility[:, j]
+                if mask.sum() < 5:
+                    continue
 
-            sigma_i = sigma_pred[mask, i, 0]
-            sigma_j = sigma_pred[mask, j, 0]
+                sim = cos_sim[mask, i, j]
+                var_target = 1 - sim
 
-            loss += F.mse_loss(sigma_i, var_target.detach())
-            loss += F.mse_loss(sigma_j, var_target.detach())
+                sigma_i = sigma_pred[mask, i, 0]
+                sigma_j = sigma_pred[mask, j, 0]
 
-            count += 2
+                loss_subset += F.mse_loss(sigma_i, var_target.detach())
+                loss_subset += F.mse_loss(sigma_j, var_target.detach())
+                count_subset += 2
 
-    if count == 0:
-        return torch.tensor(0.0, device=feat_teacher.device, requires_grad=True)
+        if count_subset > 0:
+            total_loss += weight * (loss_subset / count_subset)
+            total_count += 1
 
-    return loss / count
+    if total_count > 0:
+        return total_loss / total_count
+    else:
+        # 列表为空时也返回一个可梯度张量
+        return torch.tensor(0.0, device=device, requires_grad=True)
+
 
 def geo_loss(kpnet, f_geo, T_list, batch_idx):
     """

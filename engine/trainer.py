@@ -272,10 +272,9 @@ class TrainerMultiView:
                 f_geo_maps.append(out["f_geo"])
                 sigma_maps.append(out["sigma"])
             # ===== 4. 对每种 view 子集计算 loss =====
-            var_weights = {5:1.0, 4:0.7, 3:0.4, 2:0.1}
+            feat_teacher_list, sigma_list, visibility_list = [], [], []
             desc_weights = {5:1.0, 4:1.0, 3:1.0, 2:1.0}
-            loss_desc_total, loss_sigma_total, valid_batch = 0.0, 0.0, 0
-            valid_sigma_batch = 0
+            loss_desc_total, valid_batch = 0.0, 0
 
             for k in subset_views_list:
                 subset_ids, (corrs_k, vis_k) = batch_points_dict[k]
@@ -314,43 +313,24 @@ class TrainerMultiView:
                 feat_teacher = torch.stack(feat_teacher_per_point, dim=1)
                 
                  # ===== visibility mask =====
-                if vis_k is None:
-                    visibility = torch.ones((N_points, k), device=self.device, dtype=torch.bool)
-                else:
-                    visibility = vis_k.bool().to(self.device)
+                visibility = torch.ones((N_points, k), device=self.device, dtype=torch.bool) if vis_k is None else vis_k.bool().to(self.device)
 
                 # ===== 计算 multi-view loss =====
                 loss_desc_b = mv_infonce_masked(f_inv, visibility)
+                loss_desc_total += desc_weights[k] * loss_desc_b
+                valid_batch += 1
                 #loss_sigma_b = sigma_loss_teacher_multi_view_masked(feat_teacher, sigma, visibility)
 
-                loss_desc_total += desc_weights[k] * loss_desc_b
-                
-                
-                ###########################
-                # ✅ 只在 k == 5 时训练 variance
-                if k == 5:
-                    loss_sigma_b = sigma_loss_teacher_multi_view_masked(feat_teacher, sigma, visibility)
-                    loss_sigma_total += var_weights[k] * loss_sigma_b
-                    valid_sigma_batch += 1
-                
-                #############################
-                #loss_sigma_total += var_weights[k] * loss_sigma_b
-                valid_batch += 1
+                feat_teacher_list.append(feat_teacher)
+                sigma_list.append(sigma)
+                visibility_list.append(visibility)
 
-            # ===== 5. normalize + backward =====
-            if valid_batch > 0:
-                loss_desc = loss_desc_total / valid_batch
-                #loss_sigma = loss_sigma_total / valid_batch
-                #loss_sigma  = loss_sigma_total
-            else:
-                dummy = torch.tensor(0.0, device=self.device, requires_grad=True)
-                loss_desc = dummy
-                #loss_sigma = dummy
+            loss_desc = loss_desc_total / valid_batch if valid_batch > 0 else torch.tensor(0.0, device=self.device, requires_grad=True)
+
+             # 调用类外函数计算 sigma loss
+            loss_sigma = sigma_loss_teacher_multi_view_masked(feat_teacher_list, sigma_list, visibility_list, device=self.device)  
                 
-            if valid_sigma_batch > 0:
-                loss_sigma = loss_sigma_total / valid_sigma_batch
-            else:
-                loss_sigma = torch.tensor(0.0, device=self.device, requires_grad=True)
+
 
             loss = loss_desc + 1.0 * loss_sigma
             loss.backward()
