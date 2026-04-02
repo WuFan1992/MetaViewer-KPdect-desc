@@ -185,21 +185,45 @@ def geo_loss(kpnet, f_geo, T_list, batch_idx):
 
 
 
-def reliability_loss(rel_pred, f_inv):
+def reliability_loss_with_variance(rel_pred, f_inv, sigma_sample, topk=128, eps=1e-6):
     """
-    rel_pred: [N,V,1] predicted reliability
-    f_inv:    [N,V,C] descriptor, 用 dual-softmax 生成匹配 confidence
+    Reliability loss with variance constraint
+    rel_pred: [N,V,1] predicted reliability map
+    f_inv: [N,V,C] descriptors
+    sigma_sample: [N,V] variance prediction [0,1]
     """
     N, V, C = f_inv.shape
-    with torch.no_grad():
-        # 生成匹配概率
-        conf = torch.zeros(N, V, device=f_inv.device)
-        for i in range(V):
-            for j in range(V):
-                if i == j: continue
-                sim = F.normalize(f_inv[:, i, :], dim=1) @ F.normalize(f_inv[:, j, :], dim=1).t()
-                conf[:, i] += F.softmax(sim, dim=1).diag()
-        conf = conf / (V - 1)
-        conf = conf.clamp(0.01, 0.99)
-    rel_pred = rel_pred.squeeze(-1)
-    return F.binary_cross_entropy(rel_pred, conf)
+    f = F.normalize(f_inv, dim=2)
+    
+    conf = torch.zeros(N, V, device=f_inv.device)
+    count = 0
+    
+    for i in range(V):
+        for j in range(i + 1, V):
+            sim = f[:, i] @ f[:, j].t()  # [N,N]
+            
+            k_eff = min(topk, sim.size(1))
+            topk_val, topk_idx = torch.topk(sim, k=k_eff, dim=1)
+            
+            p_ij = F.softmax(topk_val, dim=1)
+            sim_T = sim.t()
+            topk_val_T = torch.gather(sim_T, 1, topk_idx.t()).t()
+            p_ji = F.softmax(topk_val_T, dim=1)
+            
+            conf_ij = (p_ij * p_ji).sum(dim=1)
+            
+            conf[:, i] += conf_ij
+            conf[:, j] += conf_ij
+            count += 1
+            
+    conf = conf / count
+    conf = conf.clamp(eps, 1.0 - eps)
+    
+    rel_pred = rel_pred.squeeze(-1)          # [N,V]
+    sigma_sample = sigma_sample.clamp(0, 1) # 确保在 [0,1]
+    
+    # 🔹 加入 variance 权重
+    weight = conf * (1 - conf) * torch.exp(-sigma_sample)
+    
+    loss = (weight * (rel_pred - conf)**2).mean()
+    return loss

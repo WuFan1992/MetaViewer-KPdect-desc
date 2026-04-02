@@ -265,16 +265,18 @@ class TrainerMultiView:
             
             # ===== 3. forward 每个 view =====
             V = len(images)
-            f_inv_maps, f_geo_maps, sigma_maps = [], [], []
+            f_inv_maps, f_geo_maps, sigma_maps, rel_maps = [], [], [], []
             for v in range(V):
-                out = self.kpnet(images[v].to(self.device), return_teacher=True)
+                out = self.kpnet(images[v].to(self.device))
                 f_inv_maps.append(out["f_inv"])
                 f_geo_maps.append(out["f_geo"])
-                sigma_maps.append(out["sigma"])
+                sigma_maps.append(out["sigma"].detach())
+                rel_maps.append(out["reliability"])
             # ===== 4. 对每种 view 子集计算 loss =====
             feat_teacher_list, sigma_list, visibility_list = [], [], []
             desc_weights = {5:1.0, 4:1.0, 3:1.0, 2:1.0}
             loss_desc_total, valid_batch = 0.0, 0
+            loss_rel_total = 0.0
 
             for k in subset_views_list:
                 subset_ids, (corrs_k, vis_k) = batch_points_dict[k]
@@ -291,25 +293,27 @@ class TrainerMultiView:
                     vis_k = vis_k[idx]
 
                 # ===== 采样 multi-view 特征 =====
-                f_inv_per_point, sigma_per_point, feat_teacher_per_point = [], [], []
+                f_inv_per_point, sigma_per_point, feat_teacher_per_point, rel_per_point = [], [], [], []
                 
                 for v in range(k):
                     coords = corrs_k[:, v, :].to(self.device)
                     # 采样描述子
                     f_inv_sample = sample_map_at_coords(f_inv_maps[v], coords, H_orig, W_orig)
                     sigma_sample = sample_map_at_coords(sigma_maps[v], coords, H_orig, W_orig)
+                    rel_sample = sample_map_at_coords(rel_maps[v], coords, H_orig, W_orig)
                     
-                    # teacher feature 
                     feat_teacher_map = self.kpnet.backbone.forward_xfeat(images[v].to(self.device))
                     feat_teacher_sample = sample_map_at_coords(feat_teacher_map, coords, H_orig, W_orig)
-
+                    
                     f_inv_per_point.append(f_inv_sample)
                     sigma_per_point.append(sigma_sample)
+                    rel_per_point.append(rel_sample)
                     feat_teacher_per_point.append(feat_teacher_sample)
 
                 # stack → [N_points, k, C]
                 f_inv = torch.stack(f_inv_per_point, dim=1)
                 sigma = torch.stack(sigma_per_point, dim=1)
+                rel = torch.stack(rel_per_point, dim=1) 
                 feat_teacher = torch.stack(feat_teacher_per_point, dim=1)
                 
                  # ===== visibility mask =====
@@ -319,20 +323,24 @@ class TrainerMultiView:
                 loss_desc_b = mv_infonce_masked(f_inv, visibility)
                 loss_desc_total += desc_weights[k] * loss_desc_b
                 valid_batch += 1
-                #loss_sigma_b = sigma_loss_teacher_multi_view_masked(feat_teacher, sigma, visibility)
+
+                
+                loss_rel_b = reliability_loss_with_variance(rel, f_inv, sigma_sample, topk=256)
+                loss_rel_total += desc_weights[k] * loss_rel_b
 
                 feat_teacher_list.append(feat_teacher)
                 sigma_list.append(sigma)
                 visibility_list.append(visibility)
 
             loss_desc = loss_desc_total / valid_batch if valid_batch > 0 else torch.tensor(0.0, device=self.device, requires_grad=True)
+            loss_rel = loss_rel_total / valid_batch if valid_batch > 0 else torch.tensor(0.0, device=self.device, requires_grad=True)
 
              # 调用类外函数计算 sigma loss
             loss_sigma = sigma_loss_teacher_multi_view_masked(feat_teacher_list, sigma_list, visibility_list, device=self.device)  
                 
 
 
-            loss = loss_desc + 1.0 * loss_sigma
+            loss = loss_desc + 1.0 * loss_sigma + 0.5 * loss_rel
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.kpnet.parameters(), 1.0)
             self.optimizer.step()
@@ -344,6 +352,7 @@ class TrainerMultiView:
                 f"loss:{loss.item():.4f} "
                 f"desc:{loss_desc.item():.4f} "
                 f"sigma:{loss_sigma.item():.4f} "       # dual-softmax probability loss
+                f"rel:{loss_rel.item():.4f} " 
                 #f"geo:{loss_geo.item():.4f} "       # geometric / variant descriptor reconstruction 
             )       
             
@@ -359,6 +368,7 @@ class TrainerMultiView:
             self.writer.add_scalar('Loss/total', loss.item(), iter_idx)
             self.writer.add_scalar('Loss/description', loss_desc.item(), iter_idx)   # descriptor Mahalanobis
             self.writer.add_scalar('Loss/sigma', loss_sigma.item(), iter_idx)     # dual-softmax probability loss
+            self.writer.add_scalar('Loss/reliability', loss_rel.item(), iter_idx) 
             #self.writer.add_scalar('Loss/geo', loss_geo.item(), iter_idx)     # geometric / variant descriptor reconstruction
 
 
