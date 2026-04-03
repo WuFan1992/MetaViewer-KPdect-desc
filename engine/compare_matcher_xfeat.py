@@ -81,10 +81,13 @@ def load_image(path, device):
 # 初始化
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-xfeat = XFeat(top_k = 50).to(device)
+xfeat = XFeat(top_k = 80).to(device)
 
 img_path1 = "datasets/MegaDepth_v1/0022/dense0/imgs/186069410_b743faece0_o.jpg"
-img_path2 = "datasets/MegaDepth_v1/0022/dense0/imgs/511190120_77bee89b37_o.jpg"
+img_path2 = "datasets/MegaDepth_v1/0022/dense0/imgs/312974599_28ec5e540d_o.jpg"
+
+#img_path1 = "datasets/MegaDepth_v1/0022/dense0/imgs/frame-000413.color.png"
+#img_path2 = "datasets/MegaDepth_v1/0022/dense0/imgs/frame-000240.color.png"
 
 # 读取图像
 img_tensor1, img1 = load_image(img_path1, device)
