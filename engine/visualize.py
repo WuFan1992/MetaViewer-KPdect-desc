@@ -60,9 +60,7 @@ def run_test(image_path, checkpoint_path, device="cuda"):
 
     # ===== 1. 初始化模型 =====
     model = VUDNet(feature_dim=64, dim_geo=32,
-                 dim_app=16,
-                 pose_dim=16,
-                 pose_embed=64)
+                 dim_app=16)
     
     # ===== 2. 加载权重 =====
     state_dict = torch.load(checkpoint_path, map_location=device)
@@ -86,14 +84,14 @@ def run_test(image_path, checkpoint_path, device="cuda"):
 
     # ===== 4. forward =====
     with torch.no_grad():
-        out = model(img_tensor, return_teacher=True)
+        out = model(img_tensor)
 
     # 👉 H/4, W/4
     var_map = out["sigma"][0,0].cpu().numpy()
-    #rel_map = out["reliability"][0,0].cpu().numpy()
+    rel_map = out["reliability"][0,0].cpu().numpy()
 
     print("var range:", var_map.min(), var_map.max())
-    #print("rel range:", rel_map.min(), rel_map.max())
+    print("rel range:", rel_map.min(), rel_map.max())
 
     # ===== 5. 构造 score =====
     # ⭐ 推荐：融合（最稳）
@@ -110,7 +108,7 @@ def run_test(image_path, checkpoint_path, device="cuda"):
 
     # ===== 9. heatmap（可选）=====
     var_vis = cv2.resize(var_map, (W, H))
-    #rel_vis = cv2.resize(rel_map, (W, H))
+    rel_vis = cv2.resize(rel_map, (W, H))
 
     # ===== 10. 显示 =====
     plt.figure(figsize=(18,5))
@@ -131,9 +129,9 @@ def run_test(image_path, checkpoint_path, device="cuda"):
     plt.colorbar()
 
     plt.subplot(1,4,4)
-    #plt.title("Reliability")
-    #plt.imshow(rel_vis, cmap='jet')
-    #plt.colorbar()
+    plt.title("Reliability")
+    plt.imshow(rel_vis, cmap='jet')
+    plt.colorbar()
 
     plt.show()
 
@@ -141,8 +139,8 @@ def run_test(image_path, checkpoint_path, device="cuda"):
     return None
 
 if __name__ == "__main__":
-    data_path = "datasets/MegaDepth_v1/0022/dense0/imgs/186069410_b743faece0_o.jpg"
+    #data_path = "datasets/MegaDepth_v1/0022/dense0/imgs/186069410_b743faece0_o.jpg"
     #data_path = "datasets/MegaDepth_v1/0022/dense0/imgs/8232974_61eb861d2c_o.jpg"
-    #data_path = "datasets/MegaDepth_v1/0022/dense0/imgs/frame-000413.color.png"
-    cpkt_save_path = "checkpoints/kpnet_iter_8999.pth"
+    data_path = "datasets/MegaDepth_v1/0022/dense0/imgs/frame-000413.color.png"
+    cpkt_save_path = "checkpoints/kpnet_iter_49999.pth"
     run_test(data_path, cpkt_save_path)

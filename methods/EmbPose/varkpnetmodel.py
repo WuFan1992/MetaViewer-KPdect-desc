@@ -115,37 +115,6 @@ class SharedBackbone(nn.Module):
 
         return feat
 """
-
-class SharedBackbone_XFeat(nn.Module):
-    def __init__(self, out_dim=128, freeze=True):
-        super().__init__()
-
-        self.xfeat = XFeat()
-        self.out_dim = out_dim
-
-        self.proj = nn.Sequential(
-            nn.Conv2d(64, out_dim, 1),
-            nn.GroupNorm(8, out_dim),
-            nn.ReLU(inplace=True)
-        )
-
-        if freeze:
-            for p in self.xfeat.parameters():
-                p.requires_grad = False
-
-    def forward(self, x):
-        feat = self.xfeat.getFeatDesc(x)  # [B,64,H/8,W/8]
-        feat = self.proj(feat)
-        feat = F.interpolate(feat, scale_factor=2, mode='bilinear', align_corners=False)
-        return feat
-
-    # ✅ 新增：纯 XFeat（teacher 用）
-    def forward_xfeat(self, x):
-        with torch.no_grad():
-            feat = self.xfeat.getFeatDesc(x)  # [B,64,H/8,W/8]
-            feat = F.interpolate(feat, scale_factor=2, mode='bilinear', align_corners=False)
-        return feat
-
 """
 from torchvision.models import mobilenet_v3_small
 class SharedBackbone_Light(nn.Module):
@@ -184,6 +153,37 @@ class SharedBackbone_Light(nn.Module):
             feat = F.interpolate(feat, scale_factor=2, mode='bilinear', align_corners=False)
         return feat
 """
+
+class SharedBackbone_XFeat(nn.Module):
+    def __init__(self, out_dim=128, freeze=True):
+        super().__init__()
+
+        self.xfeat = XFeat()
+        self.out_dim = out_dim
+
+        self.proj = nn.Sequential(
+            nn.Conv2d(64, out_dim, 1),
+            nn.GroupNorm(8, out_dim),
+            nn.ReLU(inplace=True)
+        )
+
+        if freeze:
+            for p in self.xfeat.parameters():
+                p.requires_grad = False
+
+    def forward(self, x):
+        feat = self.xfeat.getFeatDesc(x)  # [B,64,H/8,W/8]
+        feat = self.proj(feat)
+        feat = F.interpolate(feat, scale_factor=2, mode='bilinear', align_corners=False)
+        return feat
+
+    # ✅ 新增：纯 XFeat（teacher 用）
+    def forward_xfeat(self, x):
+        with torch.no_grad():
+            feat = self.xfeat.getFeatDesc(x)  # [B,64,H/8,W/8]
+            feat = F.interpolate(feat, scale_factor=2, mode='bilinear', align_corners=False)
+        return feat
+
 # -------------------------
 # Descriptor Encoder
 # -------------------------
@@ -263,47 +263,25 @@ class ReliabilityHead(nn.Module):
     def forward(self, x):
         return self.net(x)
     
-    
-class GeometryTransform(nn.Module):
-    def __init__(self, geo_dim=32, pose_dim=128):
+        
+class HeatmapHead(nn.Module):
+    def __init__(self, in_dim=128):
         super().__init__()
 
-        self.mlp = nn.Sequential(
-            nn.Linear(geo_dim + pose_dim, 128),
-            nn.ReLU(),
-            nn.Linear(128, geo_dim)
+        self.net = nn.Sequential(
+            nn.Conv2d(in_dim, 64, 3, padding=1),
+            nn.GroupNorm(8, 64),
+            nn.ReLU(inplace=True),
+
+            nn.Conv2d(64, 32, 3, padding=1),
+            nn.ReLU(inplace=True),
+
+            nn.Conv2d(32, 1, 1),
+            nn.Sigmoid()
         )
 
-    def forward(self, f_geo, pose_embed):
-        """
-        f_geo: [N,C]
-        pose_embed: [N,P]
-        """
-        x = torch.cat([f_geo, pose_embed], dim=1)
-        delta = self.mlp(x)
-        return f_geo + delta
-    
-
-
-# -------------------------
-# Pose Encoder
-# -------------------------
-
-class PoseEncoder(nn.Module):
-    def __init__(self, pose_dim=9, pose_embed=64):
-        super().__init__()
-
-        self.mlp = nn.Sequential(
-
-            nn.Linear(pose_dim, 64),
-            nn.ReLU(),
-
-            nn.Linear(64, pose_embed)
-        )
-
-    def forward(self, pose):
-
-        return self.mlp(pose)
+    def forward(self, x):
+        return self.net(x)   # [B,1,H,W]
     
 
 # -------------------------
@@ -314,9 +292,7 @@ class VUDNet(nn.Module):
     def __init__(self,
                  feature_dim=128,
                  dim_geo=32,
-                 dim_app=16,
-                 pose_dim=16,
-                 pose_embed=128):
+                 dim_app=16):
         super().__init__()
 
 
@@ -332,15 +308,15 @@ class VUDNet(nn.Module):
             dim_app=dim_app
         )
 
-        # pose + geometry
-        self.pose_encoder = PoseEncoder(pose_dim, pose_embed)
-        self.geo_transform = GeometryTransform(dim_geo, pose_embed)
         
         # independent variance branch (teacher-student)
         self.variance_branch = VarianceHead(feature_dim)
         
         # reliability head
         self.reliability_head = ReliabilityHead(feature_dim)
+        
+        # heatmap
+        self.heatmap_head = HeatmapHead(feature_dim)
         
 
     def forward(self, img):
@@ -357,32 +333,17 @@ class VUDNet(nn.Module):
 
         sigma_pred = self.variance_branch(xfeat_feat)
         
+        # heatmap
+        heatmap = self.heatmap_head(shared_feat)
+        
         out = {
             "f_inv": f_inv,
             "f_geo": f_geo,
             "reliability": reliability, 
-            "sigma": sigma_pred
+            "sigma": sigma_pred, 
+            "heatmap": heatmap
         }
 
 
         return out
         
-
-
-
-
-    def transform_geo(self, f_geo, T_i, T_j):
-
-        T_i_inv = torch.inverse(T_i)
-        T_ji = T_j @ T_i_inv
-
-        pose = T_ji.reshape(1, -1)
-
-        pose_embed = self.pose_encoder(pose)
-
-        N = f_geo.shape[0]
-        pose_embed = pose_embed.expand(N, -1)
-
-        f_geo_j = self.geo_transform(f_geo, pose_embed)
-
-        return f_geo_j

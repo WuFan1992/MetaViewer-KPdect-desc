@@ -143,87 +143,95 @@ def sigma_loss_teacher_multi_view_masked(feat_teacher_list, sigma_list, visibili
         # 列表为空时也返回一个可梯度张量
         return torch.tensor(0.0, device=device, requires_grad=True)
 
+def heatmap_mse_loss(pred, target):
+    return F.mse_loss(pred, target)
 
-def geo_loss(kpnet, f_geo, T_list, batch_idx):
+def heatmap_topk_loss(pred, target, topk=1024):
     """
-    f_geo: [N, V, C]
-    T_list: list of V elements, each [B,4,4]
-    batch_idx: 当前样本 index
+    pred: [B,1,H,W]
+    target: [B,1,H,W]
     """
 
-    N, V, C = f_geo.shape
-
+    B = pred.shape[0]
     loss = 0.0
-    count = 0
 
-    for i in range(V):
-        for j in range(V):
-            if i == j:
-                continue
+    for b in range(B):
+        p = pred[b].view(-1)
+        t = target[b].view(-1)
 
-            # --- 取当前 batch 的 pose ---
-            T_i = T_list[i][batch_idx]  # [4,4]
-            T_j = T_list[j][batch_idx]  # [4,4]
+        if t.sum() < 1e-6:
+            continue
 
-            # --- feature ---
-            f_i = f_geo[:, i, :]  # [N,C]
-            f_j = f_geo[:, j, :]  # [N,C]
+        k = min(topk, t.numel())
 
-            # --- transform ---
-            pred_j = kpnet.transform_geo(f_i, T_i, T_j)
-            
-            # --- normalize (optional) ---
-            pred_j = F.normalize(pred_j, dim=1)
-            f_j = F.normalize(f_j, dim=1)
+        idx = torch.topk(t, k=k).indices
 
-            # --- loss ---
-            loss += F.mse_loss(pred_j, f_j.detach())
+        loss_b = -torch.log(p[idx] + 1e-6).mean()
+        loss += loss_b
 
-            count += 1
+    return loss / B
 
-    return loss / count if count > 0 else torch.tensor(0.0, device=f_geo.device)
-
-
-
-def reliability_loss_with_variance(rel_pred, f_inv, sigma_sample, topk=128, eps=1e-6):
+def heatmap_nms_loss(pred):
     """
-    Reliability loss with variance constraint
-    rel_pred: [N,V,1] predicted reliability map
-    f_inv: [N,V,C] descriptors
-    sigma_sample: [N,V] variance prediction [0,1]
+    encourage local maxima
     """
+    maxpool = F.max_pool2d(pred, kernel_size=3, stride=1, padding=1)
+    return F.l1_loss(pred, maxpool)
+
+def heatmap_loss(pred, target):
+    loss_mse = heatmap_mse_loss(pred, target)
+    loss_topk = heatmap_topk_loss(pred, target)
+    loss_nms = heatmap_nms_loss(pred)
+
+    return loss_mse + 0.5 * loss_topk + 0.1 * loss_nms
+
+
+def reliability_loss_v2_with_target(
+    rel_pred,
+    f_inv,
+    sigma_sample,
+    topk=128,
+    eps=1e-6
+):
+    if sigma_sample.dim() == 3:
+        sigma_sample = sigma_sample.squeeze(-1)
     N, V, C = f_inv.shape
     f = F.normalize(f_inv, dim=2)
-    
-    conf = torch.zeros(N, V, device=f_inv.device)
+
+    conf = torch.zeros(N, V, device=f.device)
     count = 0
-    
+
     for i in range(V):
         for j in range(i + 1, V):
-            sim = f[:, i] @ f[:, j].t()  # [N,N]
-            
+
+            sim = f[:, i] @ f[:, j].t()
+
             k_eff = min(topk, sim.size(1))
             topk_val, topk_idx = torch.topk(sim, k=k_eff, dim=1)
-            
+
             p_ij = F.softmax(topk_val, dim=1)
+
             sim_T = sim.t()
             topk_val_T = torch.gather(sim_T, 1, topk_idx.t()).t()
             p_ji = F.softmax(topk_val_T, dim=1)
-            
+
             conf_ij = (p_ij * p_ji).sum(dim=1)
-            
+
             conf[:, i] += conf_ij
             conf[:, j] += conf_ij
             count += 1
-            
-    conf = conf / count
-    conf = conf.clamp(eps, 1.0 - eps)
-    
-    rel_pred = rel_pred.squeeze(-1)          # [N,V]
-    sigma_sample = sigma_sample.clamp(0, 1) # 确保在 [0,1]
-    
-    # 🔹 加入 variance 权重
-    weight = conf * (1 - conf) * torch.exp(-sigma_sample)
-    
-    loss = (weight * (rel_pred - conf)**2).mean()
-    return loss
+
+    conf = conf / (count + eps)
+    conf = conf.clamp(eps, 1.0)
+
+    sigma_sample = sigma_sample.squeeze(-1).clamp(0, 1)
+
+    target = conf * torch.exp(-sigma_sample)
+
+    rel_pred = rel_pred.squeeze(-1)
+
+    loss = F.mse_loss(rel_pred, target.detach())
+
+    return loss, target
+
+
