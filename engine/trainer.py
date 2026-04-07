@@ -1,3 +1,5 @@
+import argparse
+import os
 import torch
 from torch import optim
 import torch.utils.data as data
@@ -204,22 +206,28 @@ def sfm_collate_fn(batch):
 
 
 class TrainerMultiView:
-    def __init__(self, kpnet, datapath, cpkt_save_path, num_iters, top_k=4096, device=None):
+    def __init__(self, kpnet, datapath, cpkt_save_path, num_iters, batch_size=1, top_k=4096, device=None):
         self.device = device if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.kpnet = kpnet.to(self.device)
+        self.batch_size = batch_size
         
 
         #self.dataset = SfMDataset(points, images, camera_infos, datapath)
-        megadepth_datapath = "datasets/MegaDepth_v1"
-        npz_root = "datasets/scene_info_0.1_0.7"
-        npzpaths = glob.glob(npz_root+ '/*.npz')[:]
-        npzpaths = ['datasets/scene_info_0.1_0.7/0022_0.1_0.3.npz','datasets/scene_info_0.1_0.7/0022_0.3_0.5.npz', 'datasets/scene_info_0.1_0.7/0022_0.5_0.7.npz' ]
-        self.dataset = torch.utils.data.ConcatDataset( [MegaDepthDataset(root_dir = megadepth_datapath,
-                            npz_path = path) for path in tqdm.tqdm(npzpaths, desc="[MegaDepth] Loading metadata")] )
+        megadepth_datapath = datapath
+        npz_root = os.path.join(datapath, "..", "scene_info_0.1_0.7")
+        #npzpaths = glob.glob(os.path.join(npz_root, '*.npz'))[:]
+        
+        npzpaths = [os.path.join(npz_root, '0022_0.1_0.3.npz'),
+                    os.path.join(npz_root, '0022_0.3_0.5.npz'),
+                    os.path.join(npz_root, '0022_0.5_0.7.npz')]
+        self.dataset = torch.utils.data.ConcatDataset([
+            MegaDepthDataset(root_dir=megadepth_datapath, npz_path=path)
+            for path in tqdm.tqdm(npzpaths, desc="[MegaDepth] Loading metadata")
+        ])
         
         
         self.data_loader = torch.utils.data.DataLoader(
-            self.dataset, batch_size=1, shuffle=True
+            self.dataset, batch_size=self.batch_size, shuffle=True
         )
         self.optimizer = torch.optim.Adam(
             filter(lambda x: x.requires_grad, self.kpnet.parameters()), lr=3e-4
@@ -234,11 +242,25 @@ class TrainerMultiView:
         
         self.progress_bar = tqdm.tqdm(range(0, self.num_iters), desc="Training progress")
         self.writer = SummaryWriter(cpkt_save_path + f'/logdir/scr_kpdect_' + time.strftime("%Y_%m_%d-%H_%M_%S"))
-        
-        # warm-up params
-        self.geo_warmup_steps = 2000
-        self.sigma_warmup_steps = 4000
 
+    def _get_sample_data(self, batch_data, b):
+        sample_data = {}
+        for key, value in batch_data.items():
+            if isinstance(value, list):
+                if len(value) == 0:
+                    sample_data[key] = []
+                elif isinstance(value[0], torch.Tensor):
+                    sample_data[key] = [v[b] for v in value]
+                else:
+                    sample_data[key] = value[b]
+            elif isinstance(value, torch.Tensor):
+                sample_data[key] = value[b]
+            else:
+                try:
+                    sample_data[key] = value[b]
+                except Exception:
+                    sample_data[key] = value
+        return sample_data
 
     def train_iters(self):
         self.kpnet.train()
@@ -254,108 +276,119 @@ class TrainerMultiView:
                 data_iter = iter(self.data_loader)
                 batch_data = next(data_iter)
             
-            images = batch_data['images']
-            H_orig, W_orig = images[0].shape[2:]
+            # Determine batch size from the collated images structure
+            images_batch = batch_data['images']
+            if isinstance(images_batch, torch.Tensor) and images_batch.dim() == 5:
+                batch_size = images_batch.shape[0]
+            elif isinstance(images_batch, list) and len(images_batch) > 0:
+                if isinstance(images_batch[0], torch.Tensor) and images_batch[0].dim() == 4:
+                    batch_size = images_batch[0].shape[0]
+                else:
+                    batch_size = len(images_batch[0]) if len(images_batch[0]) > 0 else 1
+            else:
+                batch_size = 1
             
-             # ===== 生成互斥子集 =====
-            batch_points_dict, id_to_idx = generate_exclusive_subsets(batch_data)
 
-            # ===== 可视化 =====
-            #visualize_multi_view_matches(batch_data, batch_points_dict, id_to_idx)
-            
-            # ===== 3. forward 每个 view =====
-            V = len(images)
-            f_inv_maps, f_geo_maps, sigma_maps, rel_maps, heatmap_maps = [], [], [], [], []
-            for v in range(V):
-                out = self.kpnet(images[v].to(self.device))
-                f_inv_maps.append(out["f_inv"])
-                f_geo_maps.append(out["f_geo"])
-                sigma_maps.append(out["sigma"].detach())
-                rel_maps.append(out["reliability"])
-                heatmap_maps.append(out["heatmap"])
-            # ===== 4. 对每种 view 子集计算 loss =====
-            desc_weights = {5:1.0, 4:1.0, 3:1.0, 2:1.0}
+            desc_weights = {5: 1.0, 4: 1.0, 3: 1.0, 2: 1.0}
             loss_desc_total, valid_batch = 0.0, 0
             loss_rel_total = 0.0
             loss_heatmap_total = 0.0
             loss_sigma_total = 0.0
 
-            for k in subset_views_list:
-                subset_ids, (corrs_k, vis_k) = batch_points_dict[k]
-                N_points = corrs_k.shape[0]
+            for b in range(batch_size):
+                sample_data = self._get_sample_data(batch_data, b)
+                sample_images = sample_data['images']
+                H_orig, W_orig = sample_images[0].shape[1:]
 
-                if N_points < 20:
-                    continue
-                
-                 # ===== 限制最大点数 =====
-                max_points = 5000
-                if N_points > max_points:
-                    idx = torch.randperm(N_points)[:max_points]
-                    corrs_k = corrs_k[idx]
-                    vis_k = vis_k[idx]
+                # ===== 生成互斥子集 =====
+                batch_points_dict, id_to_idx = generate_exclusive_subsets(sample_data)
+
+                # ===== 可视化 =====
+                # visualize_multi_view_matches(sample_data, batch_points_dict, id_to_idx)
+            
+                # ===== 3. forward 每个 view =====
+                V = len(sample_images)
+                f_inv_maps, f_geo_maps, sigma_maps, rel_maps, heatmap_maps = [], [], [], [], []
+                for v in range(V):
+                    img = sample_images[v]
+                    if img.dim() == 3:
+                        img = img.unsqueeze(0)
+                    out = self.kpnet(img.to(self.device))
+                    f_inv_maps.append(out["f_inv"])
+                    f_geo_maps.append(out["f_geo"])
+                    sigma_maps.append(out["sigma"].detach())
+                    rel_maps.append(out["reliability"])
+                    heatmap_maps.append(out["heatmap"])
+                # ===== 4. 对每种 view 子集计算 loss =====
+
+                for k in subset_views_list:
+                    subset_ids, (corrs_k, vis_k) = batch_points_dict[k]
+                    N_points = corrs_k.shape[0]
+
+                    if N_points < 20:
+                        continue
+
+                    # ===== 限制最大点数 =====
+                    max_points = 5000
+                    if N_points > max_points:
+                        idx = torch.randperm(N_points)[:max_points]
+                        corrs_k = corrs_k[idx]
+                        vis_k = vis_k[idx]
                     
 
-                # ===== 采样 multi-view 特征 =====
-                f_inv_per_point, sigma_per_point, rel_per_point = [], [], []
-                
-                for v in range(k):
-                    coords = corrs_k[:, v, :].to(self.device)
-                    # 采样描述子
-                    f_inv_sample = sample_map_at_coords(f_inv_maps[v], coords, H_orig, W_orig)
-                    sigma_sample = sample_map_at_coords(sigma_maps[v], coords, H_orig, W_orig)
-                    rel_sample = sample_map_at_coords(rel_maps[v], coords, H_orig, W_orig)
-                    
-                    
-                    f_inv_per_point.append(f_inv_sample)
-                    sigma_per_point.append(sigma_sample)
-                    rel_per_point.append(rel_sample)
+                    # ===== 采样 multi-view 特征 =====
+                    f_inv_per_point, sigma_per_point, rel_per_point = [], [], []
 
-                # stack → [N_points, k, C]
-                f_inv = torch.stack(f_inv_per_point, dim=1)
-                sigma = torch.stack(sigma_per_point, dim=1)
-                rel = torch.stack(rel_per_point, dim=1) 
-                
-                 # ===== visibility mask =====
-                visibility = torch.ones((N_points, k), device=self.device, dtype=torch.bool) if vis_k is None else vis_k.bool().to(self.device)
+                    for v in range(k):
+                        coords = corrs_k[:, v, :].to(self.device)
+                        # 采样描述子
+                        f_inv_sample = sample_map_at_coords(f_inv_maps[v], coords, H_orig, W_orig)
+                        sigma_sample = sample_map_at_coords(sigma_maps[v], coords, H_orig, W_orig)
+                        rel_sample = sample_map_at_coords(rel_maps[v], coords, H_orig, W_orig)
 
-                # ===== 计算 multi-view loss =====
-                loss_desc_b = mv_infonce_masked(f_inv, visibility)
-                loss_desc_total += desc_weights[k] * loss_desc_b
-                
+                        f_inv_per_point.append(f_inv_sample)
+                        sigma_per_point.append(sigma_sample)
+                        rel_per_point.append(rel_sample)
 
-                
-                # ===== ✅ reliability（新）=====
-                # ===== ✅ reliability（改：基于 p_correct）=====
-                p_correct = compute_p_correct(f_inv, visibility)  # [N, V]
-                rel_pred = rel.squeeze(-1)  # [N, V]    
-                loss_rel_b = F.mse_loss(rel_pred, p_correct.detach())
-                loss_rel_total += desc_weights[k] * loss_rel_b
-                
-                # ===== sigma loss =====
-                loss_sigma_b, var_target = sigma_loss_from_pcorrect(f_inv, sigma, visibility)
-                loss_sigma_total += loss_sigma_b
-                
-                
-                # ===== ✅ heatmap GT（现在才正确！）=====
-                heatmap_gt = build_heatmap_target(
-                    corrs_k,
-                    visibility,
-                    sigma.squeeze(-1),   # [N,k]
-                    H_orig,
-                    W_orig,
-                    downsample=4,
-                    device=self.device
-                )
-                
-                 # ===== heatmap loss =====
-                loss_heatmap_b = 0.0
-                for v in range(k):
-                    pred_hm = heatmap_maps[v]
-                    loss_heatmap_b += heatmap_loss(pred_hm, heatmap_gt[v:v+1])
-                loss_heatmap_total += loss_heatmap_b / k
+                    # stack → [N_points, k, C]
+                    f_inv = torch.stack(f_inv_per_point, dim=1)
+                    sigma = torch.stack(sigma_per_point, dim=1)
+                    rel = torch.stack(rel_per_point, dim=1)
 
-                
-                valid_batch += 1
+                    # ===== visibility mask =====
+                    visibility = torch.ones((N_points, k), device=self.device, dtype=torch.bool) if vis_k is None else vis_k.bool().to(self.device)
+
+                    # ===== 计算 multi-view loss =====
+                    loss_desc_b = mv_infonce_masked(f_inv, visibility)
+                    loss_desc_total += desc_weights[k] * loss_desc_b
+
+                    # ===== reliability loss (confidence only, no sigma) =====
+                    loss_rel_b, rel_target = reliability_loss_from_confidence(rel, f_inv, visibility)
+                    loss_rel_total += desc_weights[k] * loss_rel_b
+
+                    # ===== sigma loss =====
+                    loss_sigma_b, var_target = sigma_loss_from_pcorrect(f_inv, sigma, visibility)
+                    loss_sigma_total += loss_sigma_b
+
+                    # ===== ✅ heatmap GT（现在才正确！） =====
+                    heatmap_gt = build_heatmap_target(
+                        corrs_k,
+                        visibility,
+                        sigma.squeeze(-1),   # [N,k]
+                        H_orig,
+                        W_orig,
+                        downsample=4,
+                        device=self.device
+                    )
+
+                    # ===== heatmap loss =====
+                    loss_heatmap_b = 0.0
+                    for v in range(k):
+                        pred_hm = heatmap_maps[v]
+                        loss_heatmap_b += heatmap_loss(pred_hm, heatmap_gt[v:v+1])
+                    loss_heatmap_total += loss_heatmap_b / k
+
+                    valid_batch += 1
 
             loss_desc = loss_desc_total / valid_batch if valid_batch > 0 else torch.tensor(0.0, device=self.device, requires_grad=True)
             loss_rel = loss_rel_total / valid_batch if valid_batch > 0 else torch.tensor(0.0, device=self.device, requires_grad=True)
@@ -370,8 +403,8 @@ class TrainerMultiView:
             loss = (
                 loss_desc
                 + 1.0 * loss_sigma
-                + 0.5 * loss_rel
-                + 0.5 * loss_heatmap   
+                + 0.1 * loss_rel      # 降低权重从0.5到0.1
+                + 0.5 * loss_heatmap
             )
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.kpnet.parameters(), 1.0)
@@ -422,12 +455,22 @@ class TrainerMultiView:
         
 
 if __name__ == "__main__":
-    data_path = "datasets/head"
-    cpkt_save_path = "checkpoints/"
-    num_iters = 50000
+    parser = argparse.ArgumentParser(description="Train the multi-view keypoint network")
+    parser.add_argument("--data_path", type=str, default="datasets/head", help="path to training data")
+    parser.add_argument("--cpkt_save_path", type=str, default="checkpoints/", help="checkpoint save directory")
+    parser.add_argument("--num_iters", type=int, default=50000, help="number of training iterations")
+    parser.add_argument("--batch_size", type=int, default=1, help="batch size for training")
+    args = parser.parse_args()
+
     variance_kpnet = VUDNet(feature_dim=64, dim_geo=32,
                  dim_app=16)
-    trainer = TrainerMultiView(variance_kpnet, data_path, cpkt_save_path, num_iters)
+    trainer = TrainerMultiView(
+        variance_kpnet,
+        args.data_path,
+        args.cpkt_save_path,
+        args.num_iters,
+        batch_size=args.batch_size
+    )
     trainer.train_iters()
 """
 feature_dim=128,

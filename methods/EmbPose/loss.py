@@ -127,15 +127,27 @@ def heatmap_loss(pred, target):
     return loss_mse + 0.5 * loss_topk + 0.1 * loss_nms
 
 
-def reliability_loss_v2_with_target(
+def reliability_loss_from_confidence(
     rel_pred,
     f_inv,
-    sigma_sample,
+    visibility,
     topk=128,
     eps=1e-6
 ):
-    if sigma_sample.dim() == 3:
-        sigma_sample = sigma_sample.squeeze(-1)
+    """
+    Reliability loss based only on matching confidence (without sigma)
+    
+    Args:
+        rel_pred: [N, V, 1] predicted reliability scores
+        f_inv: [N, V, C] feature descriptors
+        visibility: [N, V] visibility mask
+    
+    Returns:
+        loss: scalar
+        target: [N, V] target reliability (matching confidence)
+    """
+    # Compute matching confidence using the same logic as compute_p_correct
+    # but directly compute confidence scores
     N, V, C = f_inv.shape
     f = F.normalize(f_inv, dim=2)
 
@@ -144,8 +156,16 @@ def reliability_loss_v2_with_target(
 
     for i in range(V):
         for j in range(i + 1, V):
+            mask = visibility[:, i] & visibility[:, j]  # [N]
+            idx = mask.nonzero(as_tuple=False).squeeze(-1)
+            if idx.numel() < 10:
+                continue
 
-            sim = f[:, i] @ f[:, j].t()
+            fi = f[idx, i]  # [M, C]
+            fj = f[idx, j]  # [M, C]
+
+            # [M, M] similarity matrix
+            sim = fi @ fj.t()
 
             k_eff = min(topk, sim.size(1))
             topk_val, topk_idx = torch.topk(sim, k=k_eff, dim=1)
@@ -158,20 +178,19 @@ def reliability_loss_v2_with_target(
 
             conf_ij = (p_ij * p_ji).sum(dim=1)
 
-            conf[:, i] += conf_ij
-            conf[:, j] += conf_ij
+            conf[idx, i] += conf_ij
+            conf[idx, j] += conf_ij
             count += 1
 
     conf = conf / (count + eps)
     conf = conf.clamp(eps, 1.0)
 
-    sigma_sample = sigma_sample.squeeze(-1).clamp(0, 1)
-
-    target = conf * torch.exp(-sigma_sample)
+    # Target is just the confidence score (without sigma)
+    target = conf.detach()
 
     rel_pred = rel_pred.squeeze(-1)
 
-    loss = F.mse_loss(rel_pred, target.detach())
+    loss = F.mse_loss(rel_pred, target)
 
     return loss, target
 

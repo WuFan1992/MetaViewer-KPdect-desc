@@ -47,13 +47,21 @@ def load_image(path, device):
     img_tensor = img_tensor.permute(2,0,1).unsqueeze(0).to(device)
     return img_tensor, img
 
-img_path1 = "datasets/MegaDepth_v1/0022/dense0/imgs/186069410_b743faece0_o.jpg"
-img_path2 = "datasets/MegaDepth_v1/0022/dense0/imgs/511190120_77bee89b37_o.jpg"
+#img_path1 = "datasets/MegaDepth_v1/0022/dense0/imgs/186069410_b743faece0_o.jpg"
+#img_path2 = "datasets/MegaDepth_v1/0022/dense0/imgs/511190120_77bee89b37_o.jpg"
+
+#img_path1 = "datasets/MegaDepth_v1/0022/dense0/imgs/186069410_b743faece0_o.jpg"
+#img_path2 = "datasets/MegaDepth_v1/0022/dense0/imgs/307037213_48891bca3e_o.jpg"
+
+#img_path1 = "datasets/MegaDepth_v1/0022/dense0/imgs/frame-000413.color.png"
+#img_path2 = "datasets/MegaDepth_v1/0022/dense0/imgs/frame-000240.color.png"
+
+img_path1 = "datasets/MegaDepth_v1/0022/dense0/testimgs/republique1.jpg"
+img_path2 = "datasets/MegaDepth_v1/0022/dense0/testimgs/republique2.jpg"
+
 img_tensor1, img1 = load_image(img_path1, device)
 img_tensor2, img2 = load_image(img_path2, device)
 
-print("img1 shape = ", img1.shape)
-print("img2 shape = ", img2.shape)
 
 with torch.no_grad():
     out1 = net(img_tensor1)
@@ -62,32 +70,39 @@ with torch.no_grad():
 # -----------------------------
 # 3. 提取关键点（heatmap*reliability*(1-sigma)）
 # -----------------------------
-def extract_keypoints(heatmap, reliability, sigma, img_shape, num_keypoints=500):
+def extract_keypoints(heatmap, reliability, sigma, img_shape, num_keypoints=20):
     hmap = heatmap.squeeze().cpu().numpy()
     rel = reliability.squeeze().cpu().numpy()
     sig = sigma.squeeze().cpu().numpy()
     
     score = hmap * rel * (1 - sig)
-    
+
+    # ✅ ====== 新增：mask 掉边界 ======
+    margin = 16   # 👉 可以调：8 / 16 / 32
+    score[:margin, :] = 0
+    score[-margin:, :] = 0
+    score[:, :margin] = 0
+    score[:, -margin:] = 0
+
     # 提取候选点
     coords = np.argwhere(score > 0.0)[:, [1, 0]]  # (x,y)
     scores = score[score > 0.0]
 
-    # ✅ ====== 新增：始终排序 ======
+    # 排序
     idx = np.argsort(scores)[::-1]
     coords = coords[idx]
     scores = scores[idx]
 
-    # ✅ ====== 新增：score阈值过滤（可调）======
-    mask = scores > 0.001   # 👉 可以调，比如 0.05 / 0.2
+    # score阈值过滤
+    mask = scores > 0.001
     coords = coords[mask]
     scores = scores[mask]
 
-    # ✅ ====== 再做 top-K ======
+    # top-K
     coords = coords[:num_keypoints]
     scores = scores[:num_keypoints]
 
-    # ✅ ====== 关键：映射回原图坐标 ======
+    # 映射回原图
     Hf, Wf = hmap.shape
     Hi, Wi = img_shape[:2]
     
@@ -126,6 +141,7 @@ f2 = coords_to_feat(out2['f_inv'], coords2, img2.shape)
 # 4. 匹配关键点 (余弦相似度 + MNN)
 # -----------------------------
 sim = f1 @ f2.T
+
 
 # 正向最近邻
 idx12 = np.argmax(sim, axis=1)
