@@ -8,113 +8,7 @@ from methods.Xfeat.xfeat import *
 # -------------------------
 # Shared Backbone
 # -------------------------
-"""
-class SharedBackbone(nn.Module):
 
-    def __init__(self, out_dim=128, freeze=True):
-        super().__init__()
-
-        resnet = models.resnet50(
-            weights=models.ResNet50_Weights.IMAGENET1K_V1
-        )
-
-        # stem
-        self.conv1 = resnet.conv1
-        self.bn1 = resnet.bn1
-        self.relu = resnet.relu
-        self.maxpool = resnet.maxpool
-
-        # feature stages
-        self.layer1 = resnet.layer1   # H/4   C=256
-        self.layer2 = resnet.layer2   # H/8   C=512
-        self.layer3 = resnet.layer3   # H/16  C=1024
-
-        # FPN fusion
-        self.fuse = nn.Sequential(
-            nn.Conv2d(256 + 512 + 1024, 512, 3, padding=1),
-            nn.GroupNorm(16, 512),
-            nn.ReLU(inplace=True),
-
-            nn.Conv2d(512, out_dim, 1),
-            nn.GroupNorm(8, out_dim),
-            nn.ReLU(inplace=True)
-        )
-
-        if freeze:
-            for p in (
-                list(self.conv1.parameters()) +
-                list(self.bn1.parameters()) +
-                list(self.layer1.parameters()) +
-                list(self.layer2.parameters()) +
-                list(self.layer3.parameters())
-            ):
-                p.requires_grad = False
-
-
-    def forward(self, x):
-
-        # stem
-        x = self.conv1(x)   # H/2
-        x = self.bn1(x)
-        x = self.relu(x)
-        x = self.maxpool(x) # H/4
-
-        # multi-scale features
-        f1 = self.layer1(x)   # [B,256,H/4,W/4]
-        f2 = self.layer2(f1)  # [B,512,H/8,W/8]
-        f3 = self.layer3(f2)  # [B,1024,H/16,W/16]
-
-        # upsample to H/4
-        f2_up = F.interpolate(
-            f2, size=f1.shape[-2:],
-            mode='bilinear', align_corners=False
-        )
-
-        f3_up = F.interpolate(
-            f3, size=f1.shape[-2:],
-            mode='bilinear', align_corners=False
-        )
-
-        # FPN fusion
-        feat = torch.cat([f1, f2_up, f3_up], dim=1)
-
-        feat = self.fuse(feat)
-
-        return feat
-"""
-"""
-class SharedBackbone(nn.Module):
-
-    def __init__(self, out_dim=128, freeze=True):
-        super().__init__()
-
-        resnet = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V1)
-
-        self.backbone = nn.Sequential(
-            resnet.conv1,   # stride 2
-            resnet.bn1,
-            resnet.relu,
-            resnet.maxpool, # stride 2
-            resnet.layer1   # stride 1
-        )
-
-        self.proj = nn.Sequential(
-            nn.Conv2d(256, out_dim, 1),
-            nn.GroupNorm(8, out_dim),
-            nn.ReLU(inplace=True)
-        )
-
-        if freeze:
-            for p in self.backbone.parameters():
-                p.requires_grad = False
-
-    def forward(self, x):
-        with torch.no_grad():
-            feat = self.backbone(x)   # [B,256,H/4,W/4]
-        feat = self.proj(feat)    # [B,out_dim,H/4,W/4]
-
-        return feat
-"""
 """
 from torchvision.models import mobilenet_v3_small
 class SharedBackbone_Light(nn.Module):
@@ -153,36 +47,34 @@ class SharedBackbone_Light(nn.Module):
             feat = F.interpolate(feat, scale_factor=2, mode='bilinear', align_corners=False)
         return feat
 """
+from torchvision.models import mobilenet_v2
 
-class SharedBackbone_XFeat(nn.Module):
-    def __init__(self, out_dim=128, freeze=True):
+
+class SharedBackbone_MobileNet(nn.Module):
+    def __init__(self, out_dim=128, freeze=False):
         super().__init__()
 
-        self.xfeat = XFeat()
-        self.out_dim = out_dim
+        mobilenet = mobilenet_v2(pretrained=True)
+
+        # 取 feature extractor（stride 32 → 改成 stride 16）
+        self.features = mobilenet.features[:14]  # 到 stride 16
 
         self.proj = nn.Sequential(
-            nn.Conv2d(64, out_dim, 1),
+            nn.Conv2d(96, out_dim, 1),
             nn.GroupNorm(8, out_dim),
             nn.ReLU(inplace=True)
         )
 
         if freeze:
-            for p in self.xfeat.parameters():
+            for p in self.features.parameters():
                 p.requires_grad = False
 
     def forward(self, x):
-        feat = self.xfeat.getFeatDesc(x)  # [B,64,H/8,W/8]
+        feat = self.features(x)  # [B,96,H/16,W/16]
         feat = self.proj(feat)
-        feat = F.interpolate(feat, scale_factor=2, mode='bilinear', align_corners=False)
+        feat = F.interpolate(feat, scale_factor=4, mode='bilinear', align_corners=False)
         return feat
 
-    # ✅ 新增：纯 XFeat（teacher 用）
-    def forward_xfeat(self, x):
-        with torch.no_grad():
-            feat = self.xfeat.getFeatDesc(x)  # [B,64,H/8,W/8]
-            feat = F.interpolate(feat, scale_factor=2, mode='bilinear', align_corners=False)
-        return feat
 
 # -------------------------
 # Descriptor Encoder
@@ -298,7 +190,7 @@ class VUDNet(nn.Module):
 
 
         # backbone
-        self.backbone = SharedBackbone_XFeat(out_dim=feature_dim)
+        self.backbone = SharedBackbone_MobileNet(out_dim=feature_dim)
 
         # disentangle
         self.encoder = TripleDescriptorHead(
@@ -328,10 +220,7 @@ class VUDNet(nn.Module):
         # -------- ✅ reliability（关键新增）--------
         reliability = self.reliability_head(shared_feat)
         
-         # ✅ 用 XFeat 做 sigma 输入
-        xfeat_feat = self.backbone.forward_xfeat(img)
-
-        sigma_pred = self.variance_branch(xfeat_feat)
+        sigma_pred = self.variance_branch(shared_feat)
         
         # heatmap
         heatmap = self.heatmap_head(shared_feat)

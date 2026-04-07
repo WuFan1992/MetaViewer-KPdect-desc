@@ -5,143 +5,84 @@ from modules.utils import sample_map_at_coords
 # -------------------------
 # Loss functions
 # -------------------------
-"""
-def dual_softmax_loss(f_inv):
-    N, V, C = f_inv.shape
-    total_loss = 0
-    count = 0
-    for i in range(V):
-        for j in range(i+1, V):
-            fi = f_inv[:, i, :]
-            fj = f_inv[:, j, :]
-            
-            #sim = fi @ fj.t()
-            temperature = 0.1
-            sim = (fi @ fj.t()) / temperature
-            
-            log_p_ij = F.log_softmax(sim, dim=1)
-            log_p_ji = F.log_softmax(sim.t(), dim=1)
-            target = torch.arange(N, device=f_inv.device)
-            loss = F.nll_loss(log_p_ij, target) + F.nll_loss(log_p_ji, target)
-            total_loss += loss
-            count += 1
-    return total_loss / count
-"""
-def mv_infonce_masked(f_inv, visibility):
+
+def mv_infonce_masked(f_inv, visibility, tau=0.07):
     """
     f_inv: [N, V, C]
     visibility: [N, V] (bool)
     """
     N, V, C = f_inv.shape
-    f = F.normalize(f_inv, dim=-1)
+    f = F.normalize(f_inv, dim=2)  # [N,V,C]
 
-    loss = 0
+    loss = 0.0
     count = 0
 
     for i in range(V):
-        for j in range(V):
-            if i == j:
-                continue
-
-            mask = visibility[:, i] & visibility[:, j]  # ✅ 只用共可见点
-
+        for j in range(i+1, V):
+            mask = visibility[:, i] & visibility[:, j]  # [N]
             if mask.sum() < 10:
                 continue
+            fi = f[mask, i]  # [M, C]
+            fj = f[mask, j]  # [M, C]
 
-            fi = f[mask, i]
-            fj = f[mask, j]
+            # 相似度矩阵 [M, M]
+            sim = fi @ fj.t() / tau
+            labels = torch.arange(sim.shape[0], device=sim.device)  # 正确匹配在对角线
 
-            sim = fi @ fj.t()
-            logits = sim / 0.07
-
-            labels = torch.arange(fi.shape[0], device=f.device)
-
-            loss += F.cross_entropy(logits, labels)
+            loss += F.cross_entropy(sim, labels)
             count += 1
 
     if count == 0:
         return torch.tensor(0.0, device=f.device, requires_grad=True)
-
     return loss / count
 
-def cosine_variance(feat):
+def compute_p_correct(f_inv, visibility, tau=0.1, eps=1e-6):
     """
-    feat: [N, V, C] (already normalized or not)
-    return: [N]
+    f_inv: [N, V, C]
+    visibility: [N, V]
+    returns: [N, V] p_correct
     """
+    N, V, C = f_inv.shape
+    f = F.normalize(f_inv, dim=2)  # [N,V,C]
 
-    N, V, C = feat.shape
-
-    feat = F.normalize(feat, dim=-1)
-
-    var = 0.0
-    count = 0
+    p_all = torch.zeros(N, V, device=f.device)
+    count = torch.zeros(N, V, device=f.device)
 
     for i in range(V):
         for j in range(i + 1, V):
-            sim = (feat[:, i] * feat[:, j]).sum(dim=-1)  # cosine
-            var += (1.0 - sim)
-            count += 1
+            mask = visibility[:, i] & visibility[:, j]  # [N]
+            idx = mask.nonzero(as_tuple=False).squeeze(-1)
+            if idx.numel() < 10:
+                continue
 
-    return var / count
+            fi = f[idx, i]  # [M, C]
+            fj = f[idx, j]  # [M, C]
 
-def sigma_loss_teacher_multi_view_masked(feat_teacher_list, sigma_list, visibility_list, var_weights=None, device=None):
-    """
-    feat_teacher_list: list of [N, V, C]
-    sigma_list: list of [N, V, 1]
-    visibility_list: list of [N, V] (bool)
-    var_weights: dict {k: weight}
-    device: torch device
-    """
-    if var_weights is None:
-        var_weights = {5:1.0, 4:0.7, 3:0.5, 2:0.3}
+            # [M, M] 相似度矩阵
+            sim = fi @ fj.t() / tau
+            prob = F.softmax(sim, dim=1)
+            p = torch.diagonal(prob)  # [M], 正确匹配概率
 
-    if device is None:
-        # 如果列表为空，默认使用 CPU
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            # 累加
+            p_all[idx, i] += p
+            p_all[idx, j] += p
+            count[idx, i] += 1
+            count[idx, j] += 1
 
-    total_loss = 0.0
-    total_count = 0
+    p_all = p_all / (count + eps)
+    return p_all.clamp(eps, 1.0)
 
-    for idx, feat_teacher in enumerate(feat_teacher_list):
-        sigma_pred = sigma_list[idx]
-        visibility = visibility_list[idx]
+def sigma_loss_from_pcorrect(f_inv, sigma_pred, visibility):
 
-        N, V, C = feat_teacher.shape
-        f_norm = F.normalize(feat_teacher, dim=-1)
-        cos_sim = torch.einsum('nvc,nwc->nvw', f_norm, f_norm)
+    p_correct = compute_p_correct(f_inv, visibility)  # [N,V]
 
-        k = V
-        weight = var_weights.get(k, 1.0)
+    var_target = (1.0 - p_correct).detach()
 
-        loss_subset = 0.0
-        count_subset = 0
+    sigma_pred = sigma_pred.squeeze(-1)
 
-        for i in range(V):
-            for j in range(i+1, V):
-                mask = visibility[:, i] & visibility[:, j]
-                if mask.sum() < 5:
-                    continue
+    loss = F.mse_loss(sigma_pred, var_target)
 
-                sim = cos_sim[mask, i, j]
-                var_target = 1 - sim
-
-                sigma_i = sigma_pred[mask, i, 0]
-                sigma_j = sigma_pred[mask, j, 0]
-
-                loss_subset += F.mse_loss(sigma_i, var_target.detach())
-                loss_subset += F.mse_loss(sigma_j, var_target.detach())
-                count_subset += 2
-
-        if count_subset > 0:
-            total_loss += weight * (loss_subset / count_subset)
-            total_count += 1
-
-    if total_count > 0:
-        return total_loss / total_count
-    else:
-        # 列表为空时也返回一个可梯度张量
-        return torch.tensor(0.0, device=device, requires_grad=True)
+    return loss, var_target
 
 def heatmap_mse_loss(pred, target):
     return F.mse_loss(pred, target)

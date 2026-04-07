@@ -266,7 +266,6 @@ class TrainerMultiView:
             # ===== 3. forward 每个 view =====
             V = len(images)
             f_inv_maps, f_geo_maps, sigma_maps, rel_maps, heatmap_maps = [], [], [], [], []
-            xfeat_maps = []
             for v in range(V):
                 out = self.kpnet(images[v].to(self.device))
                 f_inv_maps.append(out["f_inv"])
@@ -274,13 +273,12 @@ class TrainerMultiView:
                 sigma_maps.append(out["sigma"].detach())
                 rel_maps.append(out["reliability"])
                 heatmap_maps.append(out["heatmap"])
-                xfeat_maps.append(self.kpnet.backbone.forward_xfeat(images[v].to(self.device)))
             # ===== 4. 对每种 view 子集计算 loss =====
-            feat_teacher_list, sigma_list, visibility_list = [], [], []
             desc_weights = {5:1.0, 4:1.0, 3:1.0, 2:1.0}
             loss_desc_total, valid_batch = 0.0, 0
             loss_rel_total = 0.0
             loss_heatmap_total = 0.0
+            loss_sigma_total = 0.0
 
             for k in subset_views_list:
                 subset_ids, (corrs_k, vis_k) = batch_points_dict[k]
@@ -298,7 +296,7 @@ class TrainerMultiView:
                     
 
                 # ===== 采样 multi-view 特征 =====
-                f_inv_per_point, sigma_per_point, feat_teacher_per_point, rel_per_point = [], [], [], []
+                f_inv_per_point, sigma_per_point, rel_per_point = [], [], []
                 
                 for v in range(k):
                     coords = corrs_k[:, v, :].to(self.device)
@@ -307,19 +305,15 @@ class TrainerMultiView:
                     sigma_sample = sample_map_at_coords(sigma_maps[v], coords, H_orig, W_orig)
                     rel_sample = sample_map_at_coords(rel_maps[v], coords, H_orig, W_orig)
                     
-                    feat_teacher_map = xfeat_maps[v]
-                    feat_teacher_sample = sample_map_at_coords(feat_teacher_map, coords, H_orig, W_orig)
                     
                     f_inv_per_point.append(f_inv_sample)
                     sigma_per_point.append(sigma_sample)
                     rel_per_point.append(rel_sample)
-                    feat_teacher_per_point.append(feat_teacher_sample)
 
                 # stack → [N_points, k, C]
                 f_inv = torch.stack(f_inv_per_point, dim=1)
                 sigma = torch.stack(sigma_per_point, dim=1)
                 rel = torch.stack(rel_per_point, dim=1) 
-                feat_teacher = torch.stack(feat_teacher_per_point, dim=1)
                 
                  # ===== visibility mask =====
                 visibility = torch.ones((N_points, k), device=self.device, dtype=torch.bool) if vis_k is None else vis_k.bool().to(self.device)
@@ -331,10 +325,15 @@ class TrainerMultiView:
 
                 
                 # ===== ✅ reliability（新）=====
-                loss_rel_b, rel_target = reliability_loss_v2_with_target(
-                    rel, f_inv, sigma, topk=256
-                )
+                # ===== ✅ reliability（改：基于 p_correct）=====
+                p_correct = compute_p_correct(f_inv, visibility)  # [N, V]
+                rel_pred = rel.squeeze(-1)  # [N, V]    
+                loss_rel_b = F.mse_loss(rel_pred, p_correct.detach())
                 loss_rel_total += desc_weights[k] * loss_rel_b
+                
+                # ===== sigma loss =====
+                loss_sigma_b, var_target = sigma_loss_from_pcorrect(f_inv, sigma, visibility)
+                loss_sigma_total += loss_sigma_b
                 
                 
                 # ===== ✅ heatmap GT（现在才正确！）=====
@@ -355,19 +354,16 @@ class TrainerMultiView:
                     loss_heatmap_b += heatmap_loss(pred_hm, heatmap_gt[v:v+1])
                 loss_heatmap_total += loss_heatmap_b / k
 
-                feat_teacher_list.append(feat_teacher)
-                sigma_list.append(sigma)
-                visibility_list.append(visibility)
                 
                 valid_batch += 1
 
             loss_desc = loss_desc_total / valid_batch if valid_batch > 0 else torch.tensor(0.0, device=self.device, requires_grad=True)
             loss_rel = loss_rel_total / valid_batch if valid_batch > 0 else torch.tensor(0.0, device=self.device, requires_grad=True)
             loss_heatmap = loss_heatmap_total / valid_batch if valid_batch > 0 else torch.tensor(0.0, device=self.device, requires_grad=True)
+            loss_sigma = loss_sigma_total / valid_batch if valid_batch > 0 else torch.tensor(0.0, device=self.device, requires_grad=True)
 
 
-             # 调用类外函数计算 sigma loss
-            loss_sigma = sigma_loss_teacher_multi_view_masked(feat_teacher_list, sigma_list, visibility_list, device=self.device)  
+     
                 
 
 
