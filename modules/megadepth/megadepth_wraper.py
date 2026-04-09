@@ -256,7 +256,8 @@ def generate_multi_corrs_from_data(data, scale=8, cycle_thresh=1.5):
 
     # ===== 4. scale 回原图 =====
     for i in range(V):
-        multi_corrs_5view[:, i] /= scales[i][0]
+        multi_corrs_5view[:, i, 0] /= scales[i][0]  # x scale
+        multi_corrs_5view[:, i, 1] /= scales[i][1]  # y scale
     
     # ===== vis mask（所有点都有效）=====
     vis = torch.ones(multi_corrs_5view.shape[:2], dtype=torch.bool, device=device)
@@ -286,6 +287,9 @@ def select_subset_and_recompute_multi_corrs(data_5view, subset_views=3, scale=4,
     remaining_ids = [v for v in all_ids if v != anchor_id]
     if subset_views == 1:
         subset_ids = [anchor_id]
+    elif subset_views == 2:
+        # 对于2-view，使用前两个（假设是原始pair）
+        subset_ids = all_ids[:2]
     else:
         subset_ids = [anchor_id] + list(np.random.choice(remaining_ids, subset_views-1, replace=False))
 

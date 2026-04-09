@@ -21,7 +21,10 @@ from methods.EmbPose.loss import *
 
 import numpy as np
 
+""""
+python -m engine.trainer --data_path datasets/MegaDepth_v1 --cpkt_save_path checkpoints/ --num_iters 50000 --batch_size 2
 
+"""
 def to_numpy_image(img):
     """
     统一把输入转成 (H, W, 3)
@@ -82,6 +85,7 @@ def plot_multi_view_matches(images, multi_corrs, vis=None, max_points=50, save_p
 
     imgs = [to_numpy_image(img) for img in images]
     V = len(imgs)
+
     H_list = [img.shape[0] for img in imgs]
     W_list = [img.shape[1] for img in imgs]
 
@@ -217,9 +221,9 @@ class TrainerMultiView:
         npz_root = os.path.join(datapath, "..", "scene_info_0.1_0.7")
         #npzpaths = glob.glob(os.path.join(npz_root, '*.npz'))[:]
         
-        npzpaths = [os.path.join(npz_root, '0022_0.1_0.3.npz'),
-                    os.path.join(npz_root, '0022_0.3_0.5.npz'),
-                    os.path.join(npz_root, '0022_0.5_0.7.npz')]
+        npzpaths = [os.path.join(npz_root, '0012_0.1_0.3.npz'),
+                    os.path.join(npz_root, '0012_0.3_0.5.npz'),
+                    os.path.join(npz_root, '0012_0.5_0.7.npz')]
         self.dataset = torch.utils.data.ConcatDataset([
             MegaDepthDataset(root_dir=megadepth_datapath, npz_path=path)
             for path in tqdm.tqdm(npzpaths, desc="[MegaDepth] Loading metadata")
@@ -303,8 +307,22 @@ class TrainerMultiView:
                 # ===== 生成互斥子集 =====
                 batch_points_dict, id_to_idx = generate_exclusive_subsets(sample_data)
 
+                """
+                # ===== 可视化原始2-view =====
+                if 2 in batch_points_dict:
+                    subset_ids, (corrs_2, vis_2) = batch_points_dict[2]
+                    if corrs_2.shape[0] > 0:
+                        images_vis = [sample_images[id_to_idx[i]] for i in subset_ids]
+                        plot_multi_view_matches(
+                            images=images_vis,
+                            multi_corrs=corrs_2,
+                            vis=vis_2,
+                            max_points=50,
+                            save_path=None
+                        )
+                """
                 # ===== 可视化 =====
-                # visualize_multi_view_matches(sample_data, batch_points_dict, id_to_idx)
+                visualize_multi_view_matches(sample_data, batch_points_dict, id_to_idx)
             
                 # ===== 3. forward 每个 view =====
                 V = len(sample_images)
@@ -422,7 +440,7 @@ class TrainerMultiView:
             )
             
             # 10. 定期保存 checkpoint
-            if (iter_idx+1) % 1000 == 0 and self.cpkt_save_path is not None:
+            if (iter_idx+1) % 5000 == 0 and self.cpkt_save_path is not None:
                 torch.save(self.kpnet.state_dict(), f"{self.cpkt_save_path}/kpnet_iter_{iter_idx}.pth")
             
             self.progress_bar.update(1)
