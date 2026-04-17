@@ -6,6 +6,8 @@ import numpy as np
 
 # 也就是 当某个点出现在5个view 时，repeatability = 1  当只出现在 4 个views 是， repeatability = 0.8
 # v = 3 repeatability = 0.6   v = 2 repeatability = 0.4
+import torch
+
 def build_heatmap_target(
     corrs_k,
     visibility,
@@ -15,56 +17,55 @@ def build_heatmap_target(
     device="cuda"
 ):
     """
-    corrs_k: [N, V, 2] (pixel coords in original image)
-    visibility: [N, V]
-    sigma: [N, V, 1]
+    corrs_k: [N, V, 2]  (pixel coords in original image)
+    visibility: [N, V]  (bool or 0/1)
+    sigma: [N, V, 1]    (uncertainty, assumed in [0,1])
     """
-    
-
 
     N, V, _ = corrs_k.shape
 
     Hc = H // downsample
     Wc = W // downsample
 
+    # heatmap per view
     heatmap = torch.zeros((V, 1, Hc, Wc), device=device)
     count_map = torch.zeros_like(heatmap)
 
-    for v in range(V):
-        coords = corrs_k[:, v]  # [N,2]
-        vis = visibility[:, v]
-        
-        coords = coords.to(device)
-        vis = vis.to(device)
+    # ----------------------------
+    # ✅ correct repeatability:
+    # per-point visibility ratio
+    # ----------------------------
+    visibility = visibility.to(device).float()
+    repeatability_all = visibility.sum(dim=1) / V   # [N]
 
+    for v in range(V):
+        coords = corrs_k[:, v]      # [N, 2]
+        vis = visibility[:, v].bool()
+
+        coords = coords.to(device)
+
+        # keep only visible points
         coords = coords[vis]
         if coords.shape[0] == 0:
             continue
 
-        # ↓ downsample
+        # corresponding per-point scores
+        repeatability_v = repeatability_all[vis]        # [N_vis]
+        #sigma_v = sigma[vis, v].squeeze(-1).to(device)  # [N_vis]
+
+        #stability = 1.0 - sigma_v
+        #score = repeatability_v * stability
+        score = repeatability_v
+        
+
+        # downsample to heatmap grid
         xs = (coords[:, 0] / downsample).long()
         ys = (coords[:, 1] / downsample).long()
 
         xs = xs.clamp(0, Wc - 1)
         ys = ys.clamp(0, Hc - 1)
 
-        # repeatability（=该 subset 的 view 数）
-        repeatability = float(V) / 5.0   # normalize to [0,1]
-
-        # stability（用 sigma）
-        sigma_v = sigma[vis, v]
-        stability = 1.0 - sigma_v
-
-        score = repeatability * stability  # [N_vis]
-
-        """
-        for i in range(xs.shape[0]):
-            x, y = xs[i], ys[i]
-            heatmap[v, 0, y, x] += score[i]
-            count_map[v, 0, y, x] += 1
-        """
-        #####################################
-        # ✅ vectorized（GPU并行）
+        # accumulate heatmap (vectorized)
         heatmap[v, 0].index_put_(
             (ys, xs),
             score,
@@ -76,9 +77,10 @@ def build_heatmap_target(
             torch.ones_like(score),
             accumulate=True
         )
-        ####################################
 
+    # normalize (avoid division by zero)
     heatmap = heatmap / (count_map + 1e-6)
+
     return heatmap
 
 
