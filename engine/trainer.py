@@ -221,9 +221,9 @@ class TrainerMultiView:
         npz_root = os.path.join(datapath, "..", "scene_info_0.1_0.7")
         #npzpaths = glob.glob(os.path.join(npz_root, '*.npz'))[:]
         
-        npzpaths = [os.path.join(npz_root, '0012_0.1_0.3.npz'),
-                    os.path.join(npz_root, '0012_0.3_0.5.npz'),
-                    os.path.join(npz_root, '0012_0.5_0.7.npz')]
+        npzpaths = [os.path.join(npz_root, '0022_0.1_0.3.npz'),
+                    os.path.join(npz_root, '0022_0.3_0.5.npz'),
+                    os.path.join(npz_root, '0022_0.5_0.7.npz')]
         self.dataset = torch.utils.data.ConcatDataset([
             MegaDepthDataset(root_dir=megadepth_datapath, npz_path=path)
             for path in tqdm.tqdm(npzpaths, desc="[MegaDepth] Loading metadata")
@@ -322,7 +322,7 @@ class TrainerMultiView:
                         )
                 """
                 # ===== 可视化 =====
-                visualize_multi_view_matches(sample_data, batch_points_dict, id_to_idx)
+                #visualize_multi_view_matches(sample_data, batch_points_dict, id_to_idx)
             
                 # ===== 3. forward 每个 view =====
                 V = len(sample_images)
@@ -381,7 +381,12 @@ class TrainerMultiView:
                     loss_desc_total += desc_weights[k] * loss_desc_b
 
                     # ===== reliability loss (confidence only, no sigma) =====
-                    loss_rel_b, rel_target = reliability_loss_from_confidence(rel, f_inv, visibility)
+                    loss_rel_b, rel_target = reliability_loss_hybrid(
+                        rel,
+                        f_inv,
+                        visibility,
+                        alpha=0.4
+                    )
                     loss_rel_total += desc_weights[k] * loss_rel_b
 
                     # ===== sigma loss =====

@@ -194,4 +194,84 @@ def reliability_loss_from_confidence(
 
     return loss, target
 
+def compute_matching_confidence(
+    f_inv,
+    visibility,
+    topk=128,
+    eps=1e-6
+):
+    """
+    return:
+        conf: [N, V]
+    """
+    N, V, C = f_inv.shape
+    f = F.normalize(f_inv, dim=2)
+
+    conf = torch.zeros(N, V, device=f.device)
+    count = 0
+
+    for i in range(V):
+        for j in range(i + 1, V):
+            mask = visibility[:, i] & visibility[:, j]
+            idx = mask.nonzero(as_tuple=False).squeeze(-1)
+            if idx.numel() < 10:
+                continue
+
+            fi = f[idx, i]
+            fj = f[idx, j]
+
+            sim = fi @ fj.t()
+
+            k_eff = min(topk, sim.size(1))
+            topk_val, topk_idx = torch.topk(sim, k=k_eff, dim=1)
+
+            p_ij = F.softmax(topk_val, dim=1)
+
+            sim_T = sim.t()
+            topk_val_T = torch.gather(sim_T, 1, topk_idx.t()).t()
+            p_ji = F.softmax(topk_val_T, dim=1)
+
+            conf_ij = (p_ij * p_ji).sum(dim=1)
+
+            conf[idx, i] += conf_ij
+            conf[idx, j] += conf_ij
+            count += 1
+
+    conf = conf / (count + eps)
+    conf = conf.clamp(eps, 1.0)
+
+    return conf
+
+def reliability_loss_hybrid(
+    rel_pred,
+    f_inv,
+    visibility,
+    alpha=0.4,   # p_correct 权重
+    topk=128
+):
+    """
+    Hybrid reliability target:
+        rel_target = α * p_correct + (1-α) * confidence
+    """
+
+    # ===== 1. strict matching probability =====
+    p_correct = compute_p_correct(f_inv, visibility)   # [N,V]
+
+    # ===== 2. soft matching confidence =====
+    conf = compute_matching_confidence(
+        f_inv,
+        visibility,
+        topk=topk
+    )  # [N,V]
+
+    # ===== 3. hybrid target =====
+    rel_target = alpha * p_correct + (1 - alpha) * conf
+    rel_target = rel_target.detach()
+
+    # ===== 4. loss =====
+    rel_pred = rel_pred.squeeze(-1)
+    loss = F.mse_loss(rel_pred, rel_target)
+
+    return loss, rel_target
+
 
